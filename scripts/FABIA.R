@@ -1,7 +1,6 @@
 # ==============================================================================
-# Script: fabia_full_script_with_safe_heatmap.R
 # Description: Simulate data, fit FABIA, and evaluate score & loading recovery.
-#              Includes robust heatmap helper to avoid 'breaks not unique' errors.
+#
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -277,130 +276,85 @@ fit_fabia <- function(Xlist, p = 3, alpha = 0.05, seed = 123,
 }
 
 # ------------------------------------------------------------------------------
-# 7. Evaluation: Scores
+# 7. Evaluation Functions 
 # ------------------------------------------------------------------------------
 
-evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, 
-                            plots = TRUE, title_prefix = "") {
-  
+evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TRUE, title_prefix = "") {
   true_mat <- as.matrix(true_mat)
   est_mat  <- as.matrix(est_mat)
   
-  if (nrow(true_mat) != nrow(est_mat)) stop("Sample mismatch between true and estimated factors.")
+  K_true <- ncol(true_mat); K_est <- ncol(est_mat)
+  n_f <- n_factors_eval %||% max(K_true, K_est) # Default to Max to see full picture
   
-  # Determine dimensions
-  K_true <- ncol(true_mat)
-  K_est <- ncol(est_mat)
-  n_f <- n_factors_eval %||% min(K_true, K_est)
-  
-  trueK <- true_mat[, seq_len(n_f), drop = FALSE]
+  # Ensure we look at the top factors requested
+  trueK <- true_mat[, seq_len(min(K_true, n_f)), drop = FALSE]
   estK  <- est_mat[, seq_len(min(K_est, n_f)), drop = FALSE]
-  K <- ncol(trueK)
   
-  # 1. Calculate correlations
+  # Basic Correlation
   cor_mat <- cor(trueK, estK, use = "pairwise.complete.obs")
   if (is.null(dim(cor_mat))) cor_mat <- matrix(cor_mat, nrow = 1, ncol = 1)
   cor_mat[is.na(cor_mat)] <- 0
   
-  # Name rows/cols
-  rn <- colnames(trueK) %||% paste0("True_F", seq_len(ncol(trueK)))
-  cn <- colnames(estK)  %||% paste0("Est_F", seq_len(ncol(estK)))
-  rownames(cor_mat) <- rn; colnames(cor_mat) <- cn
+  # Match via Hungarian Algorithm
+  # Note: solve_LSAP requires square matrix or logic adjustment. 
+  # We pad cor_mat to square for matching purposes.
+  dim_max <- max(dim(cor_mat))
+  cost_mat <- matrix(1, nrow = dim_max, ncol = dim_max) # 1 = max cost (0 correlation)
   
-  # 2. Match factors (Hungarian Algorithm / LSAP)
-  abs_cor <- abs(cor_mat)
-  cost <- 1 - abs_cor
-  assignment <- clue::solve_LSAP(as.matrix(cost))
-  cols <- as.integer(assignment)
+  # Fill roughly
+  nr <- nrow(cor_mat); nc <- ncol(cor_mat)
+  cost_mat[1:nr, 1:nc] <- 1 - abs(cor_mat)
   
-  # 3. Align signs based on match
-  matched_corrs <- numeric(K)
-  matched_signs <- numeric(K)
+  assignment <- clue::solve_LSAP(cost_mat)
+  cols_full <- as.integer(assignment)
   
-  for (i in seq_len(K)) {
+  # Extract matches relevant to original matrix
+  cols <- cols_full[1:nr] 
+  # If any matched index is out of bounds (phantom padding), set to NA
+  cols[cols > nc] <- NA
+  
+  # Calculate matched signs/corrs
+  matched_corrs <- numeric(nr)
+  matched_signs <- numeric(nr)
+  
+  for (i in seq_len(nr)) {
     j <- cols[i]
-    cval <- cor_mat[i, j]
-    if (is.na(cval)) cval <- 0
-    
-    matched_corrs[i] <- cval
-    sgn <- sign(cval)
-    if (sgn == 0) sgn <- 1
-    matched_signs[i] <- sgn
+    if (!is.na(j)) {
+      cval <- cor_mat[i, j]
+      matched_corrs[i] <- cval
+      matched_signs[i] <- if (sign(cval) == 0) 1 else sign(cval)
+    } else {
+      matched_corrs[i] <- 0
+      matched_signs[i] <- 1
+    }
   }
   
-  est_matched_signed <- estK[, cols, drop = FALSE] %*% diag(matched_signs)
-  colnames(est_matched_signed) <- paste0("Est_matched_", seq_len(K))
+  # Construct Signed Estimate Matrix (aligned to True)
+  # We start with zeros and fill in the matched columns
+  est_matched_signed <- matrix(0, nrow=nrow(estK), ncol=nr)
+  rownames(est_matched_signed) <- rownames(estK)
+  colnames(est_matched_signed) <- paste0("Est_matched_", seq_len(nr))
   
-  # 4. Metrics
-  mean_abs_cor <- mean(abs(matched_corrs), na.rm = TRUE)
-  prop_ge_0.7 <- mean(abs(matched_corrs) >= 0.7, na.rm = TRUE)
-  prop_ge_0.5 <- mean(abs(matched_corrs) >= 0.5, na.rm = TRUE)
-  
-  R2 <- numeric(K); MSE <- numeric(K)
-  for (i in seq_len(K)) {
-    fit <- lm(trueK[, i] ~ est_matched_signed[, i])
-    ssr <- sum((predict(fit) - mean(trueK[, i]))^2)
-    sst <- sum((trueK[, i] - mean(trueK[, i]))^2)
-    R2[i]  <- if (sst == 0) NA else ssr / sst
-    MSE[i] <- mean((trueK[, i] - est_matched_signed[, i])^2)
+  for(i in seq_len(nr)){
+    j <- cols[i]
+    if(!is.na(j)){
+      est_matched_signed[, i] <- estK[, j] * matched_signs[i]
+    }
   }
   
-  df_summary <- data.frame(
-    true_factor = colnames(trueK) %||% paste0("True", seq_len(K)),
-    matched_estimated_index = cols,
-    pearson_corr = matched_corrs,
-    abs_corr = abs(matched_corrs),
-    sign = matched_signs,
-    R2 = R2,
-    MSE = MSE,
-    stringsAsFactors = FALSE
-  )
-  
-  # 5. Plotting
-  if (plots) {
-    tmp <- cor_mat
-    if (length(unique(as.vector(tmp))) == 1) tmp <- tmp + 1e-8
-    
-    safe_pheatmap(tmp,
-                  main = paste0(title_prefix, " Score Correlation (true x est)"),
-                  display_numbers = TRUE,
-                  number_color = "black",
-                  fontsize_number = 10)
-    
-    df_plot <- data.frame(
-      true = as.vector(trueK),
-      est = as.vector(est_matched_signed),
-      factor = factor(rep(seq_len(K), each = nrow(trueK)))
-    )
-    
-    print(
-      ggplot(df_plot, aes(x = true, y = est)) +
-        geom_point(alpha = 0.6) +
-        geom_smooth(method = "lm", se = FALSE) +
-        facet_wrap(~factor, scales = "free") +
-        labs(title = paste0(title_prefix, " True vs Estimated Scores"))
-    )
-  }
-  
+  # Return
   list(
     correlation_matrix = cor_mat,
-    assignment = cols,
+    assignment = cols, # Vector of length nrow(trueK)
     matched_signs = matched_signs,
-    summary = df_summary,
-    mean_abs_cor = mean_abs_cor,
-    prop_abs_cor_ge_0.7 = prop_ge_0.7,
-    prop_abs_cor_ge_0.5 = prop_ge_0.5,
     est_signed_matched = est_matched_signed,
-    true_matched = trueK
+    true_matched = trueK,
+    unassigned_est_indices = setdiff(seq_len(ncol(estK)), cols[!is.na(cols)])
   )
 }
 
-# ------------------------------------------------------------------------------
-# 8. Evaluation: Loadings (Per Block)
-# ------------------------------------------------------------------------------
-
 evaluate_loadings_per_block <- function(true_loadings_list, est_loadings_list, 
-                                        factor_assignment, matched_signs,
+                                        factor_assignment, matched_signs, unassigned_est_indices,
                                         plots = TRUE, title_prefix = "") {
   blocks <- names(true_loadings_list)
   res_block <- list()
@@ -409,89 +363,86 @@ evaluate_loadings_per_block <- function(true_loadings_list, est_loadings_list,
     true_mat <- as.matrix(true_loadings_list[[block]])
     est_mat  <- as.matrix(est_loadings_list[[block]])
     
-    # Align by rownames if possible
-    if (!is.null(rownames(true_mat)) && 
-        !is.null(rownames(est_mat)) && 
-        all(rownames(true_mat) %in% rownames(est_mat))) {
+    # --- 1. Alignment ---
+    if (!is.null(rownames(true_mat)) && !is.null(rownames(est_mat)) && all(rownames(true_mat) %in% rownames(est_mat))) {
       est_mat <- est_mat[rownames(true_mat), , drop = FALSE]
-    } else if (nrow(true_mat) == nrow(est_mat)) {
-      warning("Row names differ but counts match; using index alignment for block: ", block)
+    } 
+    
+    # --- 2. Determine Target Dimensions (Square p x p) ---
+    p_model <- ncol(est_mat) 
+    
+    # --- 3. Construct "Est_Final" (Aligned + Unmatched) ---
+    est_final <- matrix(0, nrow = nrow(est_mat), ncol = p_model)
+    colnames(est_final) <- paste0("Est_F", seq_len(p_model))
+    
+    assigned_count <- length(factor_assignment)
+    
+    # A. Fill aligned columns
+    for (i in seq_along(factor_assignment)) {
+      est_idx <- factor_assignment[i]
+      if (!is.na(est_idx) && est_idx <= p_model) {
+        est_final[, i] <- est_mat[, est_idx] * matched_signs[i]
+      }
+    }
+    
+    # B. Fill remaining columns with Unmatched Estimated factors
+    current_cols <- seq_len(p_model)
+    filled_cols  <- seq_len(assigned_count)
+    remaining_slots <- setdiff(current_cols, filled_cols)
+    leftover_est_indices <- unassigned_est_indices
+    
+    if (length(remaining_slots) > 0 && length(leftover_est_indices) > 0) {
+      cnt <- min(length(remaining_slots), length(leftover_est_indices))
+      for (k in 1:cnt) {
+        slot <- remaining_slots[k]
+        est_idx <- leftover_est_indices[k]
+        est_final[, slot] <- est_mat[, est_idx]
+      }
+    }
+    
+    # --- 4. Pad "True_Mat" with zeros (Phantoms) ---
+    if (ncol(true_mat) < p_model) {
+      missing_n <- p_model - ncol(true_mat)
+      zeros <- matrix(0, nrow = nrow(true_mat), ncol = missing_n)
+      colnames(zeros) <- paste0("Phantom_True_", seq_len(missing_n))
+      true_mat_padded <- cbind(true_mat, zeros)
     } else {
-      stop("Feature mismatch in block ", block)
+      true_mat_padded <- true_mat
     }
+    true_mat_padded <- true_mat_padded[, 1:p_model, drop=FALSE]
     
-    # Filter assignments to ensure validity
-    factor_assignment_use <- factor_assignment
-    matched_signs_use <- matched_signs
-    max_factor <- ncol(est_mat)
-    
-    if (max(factor_assignment_use) > max_factor) {
-      valid_idx <- which(factor_assignment_use <= max_factor)
-      factor_assignment_use <- factor_assignment_use[valid_idx]
-      matched_signs_use <- matched_signs_use[valid_idx]
-    }
-    
-    # Match and Sign flip
-    est_matched <- est_mat[, factor_assignment_use, drop = FALSE] %*% diag(matched_signs_use)
-    colnames(est_matched) <- paste0("Est_matched_", seq_len(ncol(est_matched)))
-    
-    K_true_block <- ncol(true_mat)
-    K_est_block  <- ncol(est_matched)
-    K <- min(K_true_block, K_est_block)
-    
-    if (K == 0) {
-      warning("No factors to compare in block ", block)
-      res_block[[block]] <- list(summary = data.frame(), est_matched = est_matched)
-      next
-    }
-    
-    # Calculate Metrics
-    corrs <- numeric(K); rmse <- numeric(K)
-    for (k in seq_len(K)) {
-      a <- true_mat[, k]
-      bvec <- est_matched[, k]
-      corrs[k] <- suppressWarnings(cor(a, bvec, use = "pairwise.complete.obs"))
-      rmse[k] <- sqrt(mean((a - bvec)^2, na.rm = TRUE))
-    }
-    
-    df <- data.frame(
-      block = block,
-      factor = paste0("Factor", seq_len(K)),
-      pearson_corr = corrs,
-      RMSE = rmse,
-      stringsAsFactors = FALSE
-    )
-    
+    # --- 5. Visualization ---
     if (plots) {
-      # Correlation heatmap
-      cor_block <- cor(true_mat[, seq_len(K), drop = FALSE], 
-                       est_matched[, seq_len(K), drop = FALSE], 
-                       use = "pairwise.complete.obs")
+      # We suppress warnings here because 'true_mat_padded' contains columns of zeros.
+      # cor() correctly warns that SD is zero for those columns. We expect this.
+      cor_block <- suppressWarnings(cor(true_mat_padded, est_final, use = "pairwise.complete.obs"))
       
-      if (is.null(dim(cor_block))) cor_block <- matrix(cor_block, nrow = 1, ncol = 1)
+      # Replace NA (from zero-variance correlations) with 0
       cor_block[is.na(cor_block)] <- 0
       
-      # Handle constant values for heatmap stability
-      if (nrow(cor_block) > 1 && ncol(cor_block) > 1 && 
-          length(unique(as.vector(cor_block))) == 1) {
-        cor_block <- cor_block + 1e-8
-      }
-      
       rownames(cor_block) <- paste0("True_F", seq_len(nrow(cor_block)))
-      colnames(cor_block) <- paste0("Est_F", seq_len(ncol(cor_block)))
+      colnames(cor_block) <- paste0("Est_Aligned_F", seq_len(ncol(cor_block)))
       
-      safe_pheatmap(cor_block,
-                    main = paste0(title_prefix, " Loadings Correlation (", block, ")"),
-                    display_numbers = TRUE,
-                    number_color = "black",
-                    fontsize_number = 8)
+      # Force heatmap dimensions
+      safe_pheatmap(
+        cor_block,
+        main = paste0(title_prefix, " Loadings Correlation (", block, ")"),
+        display_numbers = TRUE,
+        number_color = "black",
+        fontsize_number = 9,
+        cellwidth = 30,  
+        cellheight = 30, 
+        treeheight_row = 0, 
+        treeheight_col = 0
+      )
       
-      # Scatterplot
-      df_plot <- bind_rows(lapply(seq_len(K), function(k) {
+      # Scatter plots (only for valid factors)
+      valid_k <- ncol(true_mat)
+      df_plot <- bind_rows(lapply(seq_len(valid_k), function(k) {
         data.frame(
           feature = rownames(true_mat),
           true_loading = true_mat[, k],
-          est_loading = est_matched[, k],
+          est_loading = est_final[, k],
           factor = paste0("Factor", k),
           stringsAsFactors = FALSE
         )
@@ -502,30 +453,29 @@ evaluate_loadings_per_block <- function(true_loadings_list, est_loadings_list,
           geom_point(alpha = 0.4, size = 0.6) +
           geom_smooth(method = "lm", se = FALSE) +
           facet_wrap(~factor, scales = "free") +
-          labs(title = paste0(title_prefix, " True vs Est Loadings (", block, ")"))
+          labs(title = paste0(title_prefix, " True vs Est Loadings (", block, ")")) +
+          theme_bw()
       )
     }
     
-    res_block[[block]] <- list(summary = df, est_matched = est_matched)
+    res_block[[block]] <- list(summary = "See heatmap", est_final = est_final)
   }
   
   res_block
 }
 
 # ------------------------------------------------------------------------------
-# 9. Master Wrapper: Fit & Evaluate
+# 8. Main Wrapper: Fit & Evaluate
 # ------------------------------------------------------------------------------
 
-fit_and_evaluate_fabia <- function(Xlist, sim_object = NULL, p = 3, alpha = 0.05, 
-                                   seed = 123, plots = TRUE, n_factors_eval = NULL, 
-                                   verbose = TRUE) {
+fit_and_evaluate_fabia <- function(Xlist, sim_object = NULL, p = 3, alpha = 0.05, seed = 123,
+                                   plots = TRUE, n_factors_eval = NULL, verbose = TRUE) {
   
-  # 1. Fit Model
+  # 1. Fit
   fit_res <- fit_fabia(Xlist, p = p, alpha = alpha, seed = seed, verbose = verbose)
   
+  # 2. Evaluate (if sim_object provided)
   eval_res <- NULL
-  
-  # 2. Evaluate against Truth (if provided)
   if (!is.null(sim_object) && !is.null(sim_object$list_alphas)) {
     mats <- sim_object$list_alphas
     true_mat <- do.call(cbind, lapply(mats, as.numeric))
@@ -533,16 +483,19 @@ fit_and_evaluate_fabia <- function(Xlist, sim_object = NULL, p = 3, alpha = 0.05
     rn <- rownames(sim_object$omics[[1]]) %||% seq_len(nrow(true_mat))
     rownames(true_mat) <- rn
     
-    # Evaluate Scores
+    # Pass n_factors_eval (or default to p to ensure square heatmap)
+    n_eval <- n_factors_eval %||% p
+    
+    # Score Evaluation
     eval_res <- evaluate_scores(
-      true_mat, 
-      fit_res$factor_scores, 
-      n_factors_eval = n_factors_eval, 
-      plots = plots, 
+      true_mat,
+      fit_res$factor_scores,
+      n_factors_eval = n_eval,
+      plots = plots,
       title_prefix = "FABIA"
     )
     
-    # Evaluate Loadings
+    # Loading Evaluation
     if (!is.null(sim_object$list_betas)) {
       true_loadings_list <- get_true_loadings_per_block(sim_object)
       
@@ -551,6 +504,7 @@ fit_and_evaluate_fabia <- function(Xlist, sim_object = NULL, p = 3, alpha = 0.05
         fit_res$loadings_per_block,
         factor_assignment = eval_res$assignment,
         matched_signs = eval_res$matched_signs,
+        unassigned_est_indices = eval_res$unassigned_est_indices, # Argument ensures correct heatmap dims
         plots = plots,
         title_prefix = "FABIA"
       )
@@ -564,7 +518,7 @@ fit_and_evaluate_fabia <- function(Xlist, sim_object = NULL, p = 3, alpha = 0.05
 }
 
 # ------------------------------------------------------------------------------
-# 10. Execution
+# 9. Execution
 # ------------------------------------------------------------------------------
 
 res <- fit_and_evaluate_fabia(
@@ -588,3 +542,4 @@ par(mfrow = c(1, 1))
 # res$fit$factor_scores           # Estimated factor scores
 # res$fit$loadings_per_block      # List of loadings per block
 # res$evaluation$summary          # Summary metrics for matched factors
+
