@@ -19,6 +19,50 @@ library(ggplot2)
 library(matrixStats)
 library(reshape2)
 
+
+# ------------------------------------------------------------------------------
+# 2. Data Simulation
+# ------------------------------------------------------------------------------
+
+# Simulation 1
+sim1 <- simulateMultiOmics(
+  vector_features = c(4000, 2500),
+  n_samples = 100,
+  n_factors = 3,
+  snr = 0.05,
+  signal.samples = c(3, 1),
+  signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
+  factor_structure = "mixed",
+  num.factor = "multiple",
+  seed = 123
+)
+
+# Simulation 2
+sim2 <- simulateMultiOmics(
+  vector_features = c(4000, 3500),
+  n_samples = 100,
+  n_factors = 3,
+  snr = 0.05,
+  signal.samples = c(3, 1),
+  signal.features = list(c(2.5, 0.5), c(3, 2.5)),
+  factor_structure = "mixed",
+  num.factor = "multiple",
+  seed = 123
+)
+
+# Combine omics from different simulations into one sim_object
+sim_object <- sim1
+sim_object$omics$omic2 <- sim2$omics$omic2
+sim_object[["list_betas"]][[2]] <- sim2[["list_betas"]][[2]]
+
+# Prepare final data list
+simX_list <- sim_object$omics
+names(simX_list) <- paste0("omic", seq_along(simX_list))
+
+# --- PLOT: Raw Simulation Heatmap ---
+plot_simData(sim_object = sim_object, type = "heatmap")
+
+
 # ==============================================================================
 # 2. CORE ALGORITHM: MFA-Weighted FABIA
 # ==============================================================================
@@ -224,7 +268,7 @@ evaluate_factor_recovery <- function(sim_object, res, n_factors = NULL, plot = T
   
   if (plot) {
     # 1. Heatmap
-    pheatmap(cor_mat, main = "Correlation (true factors x estimated factors)",
+    pheatmap(cor_mat, main = "Corr. score (true x estimated factors)",
              cluster_rows = FALSE, cluster_cols = FALSE, display_numbers = TRUE)
     
     # 2. Scatter plots
