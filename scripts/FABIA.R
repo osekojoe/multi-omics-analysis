@@ -38,7 +38,7 @@ sim1 <- simulateMultiOmics(
   vector_features = c(4000, 2500),
   n_samples = 100,
   n_factors = 3,
-  snr = 2.0,
+  snr = 0.05,
   signal.samples = c(3, 1),
   signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
   factor_structure = "mixed",
@@ -51,7 +51,7 @@ sim2 <- simulateMultiOmics(
   vector_features = c(4000, 3500),
   n_samples = 100,
   n_factors = 3,
-  snr = 1.0,
+  snr = 0.05,
   signal.samples = c(3, 1),
   signal.features = list(c(2.5, 0.5), c(3, 2.5)),
   factor_structure = "mixed",
@@ -67,6 +67,11 @@ sim_object[["list_betas"]][[2]] <- sim2[["list_betas"]][[2]]
 # Prepare final data list
 simX_list <- sim_object$omics
 names(simX_list) <- paste0("omic", seq_along(simX_list))
+
+
+# --- PLOT: Raw Simulation Heatmap ---
+plot_simData(sim_object = sim_object, type = "heatmap")
+
 
 # ------------------------------------------------------------------------------
 # 3. True Data Visualization & Helpers
@@ -279,12 +284,13 @@ fit_fabia <- function(Xlist, p = 3, alpha = 0.05, seed = 123,
 # 7. Evaluation Functions 
 # ------------------------------------------------------------------------------
 
+
 evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TRUE, title_prefix = "") {
   true_mat <- as.matrix(true_mat)
   est_mat  <- as.matrix(est_mat)
   
   K_true <- ncol(true_mat); K_est <- ncol(est_mat)
-  n_f <- n_factors_eval %||% max(K_true, K_est) # Default to Max to see full picture
+  n_f <- n_factors_eval %||% max(K_true, K_est) 
   
   # Ensure we look at the top factors requested
   trueK <- true_mat[, seq_len(min(K_true, n_f)), drop = FALSE]
@@ -296,12 +302,8 @@ evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TR
   cor_mat[is.na(cor_mat)] <- 0
   
   # Match via Hungarian Algorithm
-  # Note: solve_LSAP requires square matrix or logic adjustment. 
-  # We pad cor_mat to square for matching purposes.
   dim_max <- max(dim(cor_mat))
-  cost_mat <- matrix(1, nrow = dim_max, ncol = dim_max) # 1 = max cost (0 correlation)
-  
-  # Fill roughly
+  cost_mat <- matrix(1, nrow = dim_max, ncol = dim_max) 
   nr <- nrow(cor_mat); nc <- ncol(cor_mat)
   cost_mat[1:nr, 1:nc] <- 1 - abs(cor_mat)
   
@@ -310,7 +312,6 @@ evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TR
   
   # Extract matches relevant to original matrix
   cols <- cols_full[1:nr] 
-  # If any matched index is out of bounds (phantom padding), set to NA
   cols[cols > nc] <- NA
   
   # Calculate matched signs/corrs
@@ -329,8 +330,7 @@ evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TR
     }
   }
   
-  # Construct Signed Estimate Matrix (aligned to True)
-  # We start with zeros and fill in the matched columns
+  # Construct Signed Estimate Matrix
   est_matched_signed <- matrix(0, nrow=nrow(estK), ncol=nr)
   rownames(est_matched_signed) <- rownames(estK)
   colnames(est_matched_signed) <- paste0("Est_matched_", seq_len(nr))
@@ -342,10 +342,51 @@ evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TR
     }
   }
   
+  # --- PLOTTING LOGIC (Restored) ---
+  if (plots) {
+    # 1. Heatmap of Score Correlations
+    tmp <- cor_mat
+    # Handle constant values for heatmap breaks
+    if (length(unique(as.vector(tmp))) == 1) tmp <- tmp + 1e-8
+    
+    rownames(tmp) <- paste0("True_F", seq_len(nrow(tmp)))
+    colnames(tmp) <- paste0("Est_F", seq_len(ncol(tmp)))
+    
+    safe_pheatmap(
+      tmp,
+      main = paste0(title_prefix, " Score Correlation (true x est)"),
+      display_numbers = TRUE,
+      number_color = "black",
+      fontsize_number = 10,
+      cellwidth = 30,  # Consistent size with loading heatmaps
+      cellheight = 30,
+      treeheight_row = 0,
+      treeheight_col = 0
+    )
+    
+    # 2. Scatter Plots (True vs Matched Estimated Scores)
+    # Only plot the valid true factors (ignore phantom padding if it existed)
+    K_plot <- ncol(trueK)
+    df_plot <- data.frame(
+      true = as.vector(trueK),
+      est = as.vector(est_matched_signed[, 1:K_plot, drop=FALSE]),
+      factor = factor(rep(paste0("Factor ", seq_len(K_plot)), each = nrow(trueK)))
+    )
+    
+    print(
+      ggplot(df_plot, aes(x = true, y = est)) +
+        geom_point(alpha = 0.6) +
+        geom_smooth(method = "lm", se = FALSE) +
+        facet_wrap(~factor, scales = "free") +
+        labs(title = paste0(title_prefix, " True vs Estimated Scores")) +
+        theme_bw()
+    )
+  }
+  
   # Return
   list(
     correlation_matrix = cor_mat,
-    assignment = cols, # Vector of length nrow(trueK)
+    assignment = cols, 
     matched_signs = matched_signs,
     est_signed_matched = est_matched_signed,
     true_matched = trueK,
@@ -421,12 +462,12 @@ evaluate_loadings_per_block <- function(true_loadings_list, est_loadings_list,
       cor_block[is.na(cor_block)] <- 0
       
       rownames(cor_block) <- paste0("True_F", seq_len(nrow(cor_block)))
-      colnames(cor_block) <- paste0("Est_Aligned_F", seq_len(ncol(cor_block)))
+      colnames(cor_block) <- paste0("Est_F", seq_len(ncol(cor_block)))
       
       # Force heatmap dimensions
       safe_pheatmap(
         cor_block,
-        main = paste0(title_prefix, " Loadings Correlation (", block, ")"),
+        main = paste0(title_prefix, " Loadings Corr. (", block, ")"),
         display_numbers = TRUE,
         number_color = "black",
         fontsize_number = 9,
