@@ -19,14 +19,22 @@ library(fabia)
 # 1. Simulated Data Generation
 # ------------------------------------------------------------------------------
 sim1 <- simulateMultiOmics(
-  vector_features = c(4000, 2500), n_samples = 100, n_factors = 3, snr = 2.0,
-  signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
+  vector_features = c(4000, 2500),
+  n_samples = 100,
+  n_factors = 3,
+  snr = 0.05,
+  signal.samples = c(3, 1),
+  signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
   factor_structure = "mixed", num.factor = "multiple", seed = 123
 )
 
 sim2 <- simulateMultiOmics(
-  vector_features = c(4000, 3500), n_samples = 100, n_factors = 3, snr = 1.0,
-  signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
+  vector_features = c(4000, 3500),
+  n_samples = 100,
+  n_factors = 3,
+  snr = 0.05,
+  signal.samples = c(3, 1),
+  signal.features = list(c(2.5, 0.5), c(3, 2.5)),
   factor_structure = "mixed", num.factor = "multiple", seed = 123
 )
 
@@ -143,7 +151,7 @@ evaluate_scores <- function(true_mat, est_mat, n_factors_eval = NULL, plots = TR
   }
   
   est_matched_signed <- estK[, cols, drop = FALSE] %*% diag(matched_signs)
-  colnames(est_matched_signed) <- paste0("Est_matched_", seq_len(n_f))
+  colnames(est_matched_signed) <- paste0("Est_F", seq_len(n_f))
   
   # 3. Visualizations (Integrated)
   if (plots) {
@@ -198,7 +206,7 @@ evaluate_loadings_per_block <- function(true_loadings_list, est_loadings_list, f
     matched_signs_use <- matched_signs[valid_idx]
     
     est_matched <- est_mat[, factor_assignment_use, drop = FALSE] %*% diag(matched_signs_use)
-    colnames(est_matched) <- paste0("Est_matched_", seq_len(ncol(est_matched)))
+    colnames(est_matched) <- paste0("Est_F", seq_len(ncol(est_matched)))
     
     K <- min(ncol(true_mat), ncol(est_matched))
     
