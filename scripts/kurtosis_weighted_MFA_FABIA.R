@@ -2,7 +2,7 @@
 # 1. SETUP & LIBRARIES
 # ==============================================================================
 
-# Ensure required packages are installed (Added 'e1071' for Kurtosis)
+# Required packages 
 required_pkgs <- c("SUMO", "FactoMineR", "fabia", "clue", "pheatmap", 
                    "ggplot2", "matrixStats", "reshape2", "e1071")
 to_install <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
@@ -40,7 +40,7 @@ sim2 <- simulateMultiOmics(
   vector_features = c(4000, 3500),
   n_samples = 100,
   n_factors = 3,
-  snr = 0.7,
+  snr = 0.5,
   signal.samples = c(3, 1),
   signal.features = list(c(2.5, 0.5), c(3, 2.5)),
   factor_structure = "mixed",
