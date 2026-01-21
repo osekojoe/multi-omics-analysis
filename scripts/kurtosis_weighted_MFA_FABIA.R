@@ -634,4 +634,296 @@ recon_stats <- evaluate_reconstruction(simX_list, res_kurtosis)
 cat(sprintf("Global Variance Explained: %.2f%%\n", recon_stats$R2_global * 100))
 
 
+# ==============================================================================
+# 8. PER-FACTOR SNR TREND ANALYSIS
+# ==============================================================================
+
+# 1. Define range: 0.01 to 2.0 with steps of 0.05
+snr_values <- seq(from = 0.01, to = 2.0, by = 0.1)
+
+# Initialize storage
+factor_results <- data.frame(
+  SNR = numeric(),
+  Omic = character(),
+  Factor = character(),
+  Best_Correlation = numeric(),
+  stringsAsFactors = FALSE
+)
+
+message(sprintf("Analyzing Factor-Specific Recovery across %d SNR steps...", length(snr_values)))
+pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
+
+for (i in seq_along(snr_values)) {
+  s <- snr_values[i]
+  setTxtProgressBar(pb, i)
+  
+  # --- A. Re-simulate Data ---
+  # We use the same structure as before
+  sim1_s <- simulateMultiOmics(
+    vector_features = c(4000, 2500), n_samples = 100, n_factors = 3,
+    snr = s, 
+    signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
+    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  )
+  sim2_s <- simulateMultiOmics(
+    vector_features = c(4000, 3500), n_samples = 100, n_factors = 3,
+    snr = s,
+    signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
+    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  )
+  
+  sim_obj_s <- sim1_s
+  sim_obj_s$omics$omic2 <- sim2_s$omics$omic2
+  sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
+  simX_s <- sim_obj_s$omics
+  names(simX_s) <- paste0("omic", seq_along(simX_s))
+  
+  # --- B. Run Sparse MFA-FABIA ---
+  res_s <- suppressMessages(
+    mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1)
+  )
+  
+  # --- C. Get Correlation Matrices ---
+  eval_load_s <- evaluate_loading_recovery(sim_obj_s, res_s$fabia, verbose = FALSE)
+  per_omic_s <- per_omic_loading_recovery(
+    eval_res = eval_load_s, sim_object = sim_obj_s, 
+    plot_heatmaps = FALSE, plot_scatter = FALSE
+  )
+  
+  # --- D. Extract Max Correlation PER FACTOR ---
+  
+  # Function to extract best match for each row (True Factor)
+  extract_best_matches <- function(omic_res, omic_name, snr_val) {
+    cormat <- omic_res$cormat
+    # Iterate through True Factors (Rows of the correlation matrix)
+    if (!is.null(cormat) && nrow(cormat) > 0) {
+      for (f_idx in 1:nrow(cormat)) {
+        # Find the single highest absolute correlation in this row
+        best_val <- max(abs(cormat[f_idx, ]), na.rm = TRUE)
+        
+        # Append to global dataframe
+        factor_results <<- rbind(factor_results, data.frame(
+          SNR = snr_val,
+          Omic = omic_name,
+          Factor = rownames(cormat)[f_idx], # e.g., "factor1"
+          Best_Correlation = best_val
+        ))
+      }
+    }
+  }
+  
+  # Run extraction for both omics
+  extract_best_matches(per_omic_s$omic1, "Omic1", s)
+  extract_best_matches(per_omic_s$omic2, "Omic2", s)
+}
+close(pb)
+
+# ==============================================================================
+# 9. PLOTTING
+# ==============================================================================
+
+# Clean factor names for plotting (optional)
+factor_results$Factor <- factor(factor_results$Factor, levels = c("factor1", "factor2", "factor3"))
+
+ggplot(factor_results, aes(x = SNR, y = Best_Correlation, color = Factor)) +
+  # Facet by Omic so we can see differences between layers
+  facet_wrap(~Omic) + 
+  geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
+  #geom_line(alpha = 0.7, size = 1) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
+  scale_x_continuous(breaks = seq(0, 2, 0.5)) +
+  scale_y_continuous(limits = c(0, 1.05)) +
+  labs(
+    title = "Differential Factor Recovery Analysis",
+    subtitle = "Tracking the single best bicluster match for each True Factor",
+    x = "Signal-to-Noise Ratio (SNR)",
+    y = "Max Correlation (Recovery Score)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+
+
+
+##############################################################
+# ==============================================================================
+# 10. JACCARD INDEX TREND ANALYSIS 
+# ==============================================================================
+
+# 1. Define range and parameters
+snr_values <- seq(from = 0.01, to = 2.0, by = 0.1)
+top_n_features <- 400  # Number of top features to compare
+
+# Initialize storage
+jaccard_results <- data.frame(
+  SNR = numeric(),
+  Omic = character(),
+  Factor = character(),
+  Jaccard_Index = numeric(),
+  stringsAsFactors = FALSE
+)
+
+message(sprintf("Analyzing Jaccard Overlap (Top %d) across %d SNR steps...", 
+                top_n_features, length(snr_values)))
+pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
+
+for (i in seq_along(snr_values)) {
+  s <- snr_values[i]
+  setTxtProgressBar(pb, i)
+  
+  # --- A. Re-simulate Data ---
+  sim1_s <- simulateMultiOmics(
+    vector_features = c(4000, 2500), n_samples = 100, n_factors = 3,
+    snr = s, 
+    signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
+    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  )
+  sim2_s <- simulateMultiOmics(
+    vector_features = c(4000, 3500), n_samples = 100, n_factors = 3,
+    snr = s,
+    signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
+    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  )
+  
+  sim_obj_s <- sim1_s
+  sim_obj_s$omics$omic2 <- sim2_s$omics$omic2
+  sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
+  simX_s <- sim_obj_s$omics
+  names(simX_s) <- paste0("omic", seq_along(simX_s))
+  
+  # --- B. Run Sparse MFA-FABIA ---
+  res_s <- suppressMessages(
+    mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1)
+  )
+  
+  # --- C. ROBUST Helper to Get True Loadings per Block ---
+  # This ensures that "beta2" from simulation always goes to Column 2 (Factor 2)
+  # preventing color/label mismatch when Factor 1 is missing.
+  get_true_block_robust <- function(sim_obj, block_idx, n_global_factors = 3) {
+    betas_list <- sim_obj$list_betas[[block_idx]]
+    
+    # Determine number of features (rows) from the first available vector
+    if (length(betas_list) > 0) {
+      n_features <- length(betas_list[[1]])
+    } else {
+      return(NULL)
+    }
+    
+    # Initialize matrix of ZEROS for ALL global factors (1 to 3)
+    mat_out <- matrix(0, nrow = n_features, ncol = n_global_factors)
+    colnames(mat_out) <- paste0("factor", 1:n_global_factors)
+    
+    # Populate columns based on names (e.g., "beta2" -> Column 2)
+    if (is.list(betas_list)) {
+      names_betas <- names(betas_list)
+      for (nm in names_betas) {
+        # Extract index from string "betaX"
+        if (grepl("beta", nm)) {
+          idx <- as.integer(sub("beta", "", nm))
+        } else {
+          idx <- as.integer(nm) # Fallback
+        }
+        
+        # If valid index, fill the specific column
+        if (!is.na(idx) && idx <= n_global_factors) {
+          mat_out[, idx] <- as.numeric(betas_list[[nm]])
+        }
+      }
+    } else if (is.matrix(betas_list)) {
+      # If already a matrix, fill safely
+      k <- min(ncol(betas_list), n_global_factors)
+      mat_out[, 1:k] <- betas_list[, 1:k]
+    }
+    
+    return(mat_out)
+  }
+  
+  # --- D. Calculate Jaccard per Omic / per Factor ---
+  
+  process_jaccard <- function(omic_name, block_idx) {
+    # 1. Get True Matrix (Robust)
+    true_mat <- get_true_block_robust(sim_obj_s, block_idx, n_global_factors = 3)
+    if (is.null(true_mat)) return(NULL)
+    
+    # Get Estimated Loadings
+    if (!omic_name %in% names(res_s$fabia$loadings_per_block)) return(NULL)
+    est_mat <- res_s$fabia$loadings_per_block[[omic_name]]
+    
+    # 2. Match and Calculate
+    if (ncol(est_mat) > 0) {
+      cormat <- cor(true_mat, est_mat, use="pairwise.complete.obs")
+      cormat[is.na(cormat)] <- 0
+      
+      # Iterate through Global Factors (1, 2, 3)
+      for (f in 1:ncol(true_mat)) {
+        fname <- colnames(true_mat)[f]
+        
+        # SKIP empty true factors (if signal is zero, Jaccard is meaningless)
+        # We record 0 to keep the plot lines consistent
+        if (sd(true_mat[, f]) < 1e-6) {
+          jaccard_results <<- rbind(jaccard_results, data.frame(
+            SNR = s, Omic = omic_name, Factor = fname, Jaccard_Index = 0
+          ))
+          next
+        }
+        
+        # Find best estimated match
+        best_match_idx <- which.max(abs(cormat[f, ]))
+        
+        if (length(best_match_idx) > 0) {
+          v_true <- true_mat[, f]
+          v_est  <- est_mat[, best_match_idx]
+          
+          top_true <- order(abs(v_true), decreasing = TRUE)[1:top_n_features]
+          top_est  <- order(abs(v_est), decreasing = TRUE)[1:top_n_features]
+          
+          intersect_len <- length(intersect(top_true, top_est))
+          union_len     <- length(union(top_true, top_est))
+          
+          j_val <- if(union_len > 0) intersect_len / union_len else 0
+          
+          jaccard_results <<- rbind(jaccard_results, data.frame(
+            SNR = s, Omic = omic_name, Factor = fname, Jaccard_Index = j_val
+          ))
+        }
+      }
+    }
+  }
+  
+  process_jaccard("omic1", 1)
+  process_jaccard("omic2", 2)
+}
+close(pb)
+
+# ==============================================================================
+# 11. PLOTTING JACCARD TREND
+# ==============================================================================
+
+# Ensure factors are ordered for the legend
+jaccard_results$Factor <- factor(jaccard_results$Factor, levels = c("factor1", "factor2", "factor3"))
+
+ggplot(jaccard_results, aes(x = SNR, y = Jaccard_Index, color = Factor)) +
+  facet_wrap(~Omic) + 
+  geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
+  # geom_line(alpha = 0.7, size = 1) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
+  scale_x_continuous(breaks = seq(0, 2, 0.5)) +
+  scale_y_continuous(limits = c(0, 1.0), breaks = seq(0, 1, 0.1)) +
+  labs(
+    title = "Feature Selection Overlap (Jaccard Index) vs. SNR",
+    subtitle = sprintf("Comparison of Top %d loaded features (True vs Best Estimated Match)", top_n_features),
+    x = "Signal-to-Noise Ratio (SNR)",
+    y = "Jaccard Index (Intersection / Union)"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
 
