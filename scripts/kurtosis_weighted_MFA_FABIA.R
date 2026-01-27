@@ -19,7 +19,7 @@ library(reshape2)
 library(e1071) # Required for kurtosis calculation
 
 # ==============================================================================
-# 2. Data Simulation (UNCHANGED)
+# 2. Data Simulation 
 # ==============================================================================
 
 # Simulation 1
@@ -27,7 +27,7 @@ sim1 <- simulateMultiOmics(
   vector_features = c(4000, 2500),
   n_samples = 100,
   n_factors = 3,
-  snr = 0.5,
+  snr = 0.05,
   signal.samples = c(3, 1),
   signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
   factor_structure = "mixed",
@@ -40,7 +40,7 @@ sim2 <- simulateMultiOmics(
   vector_features = c(4000, 3500),
   n_samples = 100,
   n_factors = 3,
-  snr = 0.5,
+  snr = 0.05,
   signal.samples = c(3, 1),
   signal.features = list(c(2.5, 0.5), c(3, 2.5)),
   factor_structure = "mixed",
@@ -639,7 +639,7 @@ cat(sprintf("Global Variance Explained: %.2f%%\n", recon_stats$R2_global * 100))
 # ==============================================================================
 
 # 1. Define range: 0.01 to 2.0 with steps of 0.05
-snr_values <- seq(from = 0.01, to = 2.0, by = 0.1)
+snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
 
 # Initialize storage
 factor_results <- data.frame(
@@ -755,7 +755,7 @@ ggplot(factor_results, aes(x = SNR, y = Best_Correlation, color = Factor)) +
 # ==============================================================================
 
 # 1. Define range and parameters
-snr_values <- seq(from = 0.01, to = 2.0, by = 0.1)
+snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
 top_n_features <- 400  # Number of top features to compare
 
 # Initialize storage
