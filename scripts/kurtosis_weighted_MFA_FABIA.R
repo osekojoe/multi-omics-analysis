@@ -4,11 +4,11 @@
 
 # Required packages 
 required_pkgs <- c("SUMO", "FactoMineR", "fabia", "clue", "pheatmap", 
-                   "ggplot2", "matrixStats", "reshape2", "e1071")
+                   "ggplot2", "matrixStats", "reshape2", "e1071", "pROC")
 to_install <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
 if (length(to_install)) install.packages(to_install)
 
-library(SUMO)
+library(SUMO)         # For simulateMultiOmics
 library(FactoMineR)
 library(fabia)
 library(clue)
@@ -16,11 +16,14 @@ library(pheatmap)
 library(ggplot2)
 library(matrixStats)
 library(reshape2)
-library(e1071) # Required for kurtosis calculation
+library(e1071)        # Required for kurtosis calculation
+library(pROC)
 
 # ==============================================================================
-# 2. Data Simulation 
+# 2. DATA SIMULATION 
 # ==============================================================================
+
+message("--- Step 1: Simulating Data ---")
 
 # Simulation 1
 sim1 <- simulateMultiOmics(
@@ -58,27 +61,29 @@ simX_list <- sim_object$omics
 names(simX_list) <- paste0("omic", seq_along(simX_list))
 
 # --- PLOT: Raw Simulation Heatmap ---
-plot_simData(sim_object = sim_object, type = "heatmap")
+# plot_simData(sim_object = sim_object, type = "heatmap")
 
 
 # ==============================================================================
-# 3. CORE ALGORITHM: Kurtosis-Weighted MFA-FABIA
+# 3. CORE ALGORITHM: Kurtosis-Weighted MFA-FABIA (Refined)
 # ==============================================================================
 
-#' Run FABIA with feature weighting based on Kurtosis (Non-Normality)
+
+
+#' Run FABIA with feature weighting based on Kurtosis and MFA Normalization
 #'
 #' @param Xlist List of matrices (omics data).
 #' @param gamma Tempering parameter for weights (0 = no weighting).
 #' @param p FABIA parameter (number of biclusters).
 #' @param alpha FABIA parameter (sparseness). Lower values = denser loadings.
-#' @param block_equalize Boolean. Equalize block variance before MFA?
+#' @param block_equalize Boolean. Equalize block variance via Lambda1?
 #' @param scale_vars Boolean. Scale variables?
 #' @param seed Random seed.
 #' @return List containing MFA results, weighted data, FABIA results, and weights.
 mfa_weighted_fabia <- function(Xlist,
                                gamma = 0.5,
                                p = 3, 
-                               alpha = 0.5, # Default lowered to allow denser loadings
+                               alpha = 0.5,
                                block_equalize = TRUE,
                                scale_vars = TRUE,
                                seed = 1) {
@@ -87,91 +92,76 @@ mfa_weighted_fabia <- function(Xlist,
   stopifnot(is.list(Xlist), length(Xlist) >= 2)
   set.seed(seed)
   
-  # --- Helper: clean NA/Inf per block ---
-  clean_block <- function(M) {
+  # --- Helper: Robust Cleaning ---
+  # Remove zero-variance columns and handle Infs
+  clean_and_prep <- function(M) {
     M <- as.matrix(M)
-    all_bad <- apply(M, 2, function(z) all(!is.finite(z)))
-    if (any(all_bad)) M <- M[, !all_bad, drop = FALSE]
+    vars <- matrixStats::colVars(M)
+    # Remove constant columns (variance approx 0)
+    M <- M[, vars > 1e-9, drop = FALSE]
+    return(M)
+  }
+  
+  # A. Robust Preprocessing
+  Xlist_clean <- lapply(Xlist, clean_and_prep)
+  
+  # B. MFA Block Equalizing & Scaling
+  # Logic matched to Script 1:
+  # 1. Scale Variables
+  # 2. Divide block by sqrt(First Eigenvalue)
+  
+  Zlist <- lapply(Xlist_clean, function(X) {
+    # 1. Standard Scaling (Mean 0, Sd 1)
+    if(scale_vars) {
+      s <- scale(X)
+      s[is.na(s)] <- 0
+    } else {
+      s <- scale(X, scale = FALSE)
+    }
     
-    for (j in seq_len(ncol(M))) {
-      z <- M[, j]
-      bad <- !is.finite(z)
-      if (any(bad)) {
-        m <- mean(z[is.finite(z)], na.rm = TRUE)
-        if (!is.finite(m)) m <- 0
-        z[bad] <- m
-        M[, j] <- z
+    # 2. MFA Normalization
+    if(block_equalize) {
+      # Calculate PCA for this block
+      pca_block <- prcomp(s, center = FALSE, scale. = FALSE)
+      # Get first eigenvalue (lambda 1)
+      lambda1 <- pca_block$sdev[1]^2
+      
+      # Divide by sqrt(lambda1) to equalize inertia of the first dimension
+      if(lambda1 > 1e-9) {
+        s <- s / sqrt(lambda1)
       }
     }
-    M
-  }
-  
-  # --- 1) Preprocess ---
-  Zlist <- lapply(Xlist, function(X) {
-    X <- as.matrix(X)
-    if (scale_vars) X <- scale(X) else X <- scale(X, scale = FALSE)
-    X
+    return(s)
   })
   
-  if (block_equalize) {
-    Zlist <- Map(function(Z, k) Z / sqrt(k), Zlist, lapply(Zlist, ncol))
-  }
-  
-  Zlist <- lapply(Zlist, clean_block)
-  
+  # Rename features with prefix (Crucial for splitting later)
   names(Zlist) <- names(Zlist) %||% paste0("omic", seq_along(Zlist))
-  for (g in seq_along(Zlist)) {
-    if (is.null(colnames(Zlist[[g]]))) {
-      colnames(Zlist[[g]]) <- paste0("V", seq_len(ncol(Zlist[[g]])))
-    }
-    colnames(Zlist[[g]]) <- paste0(names(Zlist)[g], "_", colnames(Zlist[[g]]))
-  }
+  for(n in names(Zlist)) colnames(Zlist[[n]]) <- paste0(n, "_", colnames(Zlist[[n]]))
   
-  Z   <- do.call(cbind, Zlist)              
-  grp <- vapply(Zlist, ncol, integer(1))    
+  # Combine into Global Matrix Z
+  Z <- do.call(cbind, Zlist)
+  grp <- vapply(Zlist, ncol, integer(1)) 
   
-  # --- 2) MFA (Structure Preservation) ---
-  # We still run MFA to preserve the structural information object
-  # even though we switched weighting to Kurtosis.
-  df_all <- as.data.frame(Z)
-  mfa <- FactoMineR::MFA(
-    df_all,
-    group      = grp,
-    type       = rep("s", length(grp)),
-    ncp        = 5,
-    name.group = names(Zlist),
-    graph      = FALSE
-  )
+  # --- C. Feature Weighting (Kurtosis) ---
   
-  # --- 3) Build feature weights (KURTOSIS FIX) ---
-  # Replaces previous cos2 method.
-  # Logic: High Kurtosis = Heavy Tails = Informative for FABIA (Sparse Signal)
-  #        Low Kurtosis  = Gaussian    = Noise
   
   message("Calculating Kurtosis for feature weighting...")
   
-  # Calculate Excess Kurtosis (Normal = 0)
+  # Calculate Excess Kurtosis
   kurt_vals <- apply(Z, 2, e1071::kurtosis, type = 2, na.rm = TRUE)
   
-  # FABIA loves positive excess kurtosis (heavy tails).
-  # We floor negative kurtosis (platykurtic/flat) to 0 or a small epsilon
-  # so we don't zero out weights completely but de-prioritize them significantly.
+  # Weighting Logic:
+  # High kurtosis (heavy tails) -> High weight
   w_raw <- pmax(0, kurt_vals) 
-  
-  # Normalize weights
   mean_w <- mean(w_raw, na.rm = TRUE)
-  if (mean_w == 0) mean_w <- 1 # Safety check
-  w <- w_raw / mean_w
-  
-  # Handle potential NAs
+  if (mean_w == 0) mean_w <- 1 
+  w <- (w_raw / mean_w)^gamma
   w[!is.finite(w)] <- 0
   
-  # Apply tempering
-  w <- w^gamma
+  # Apply Weights
+  Z_w <- sweep(Z, 2, w, `*`)
   
-  # --- 4) Apply weights ---
-  Z_w <- sweep(Z, 2, w, `*`)    
-  
+  # Create weighted blocks list (for return object)
   cuts <- cumsum(grp)
   weighted_blocks <- lapply(seq_along(grp), function(i) {
     if (i == 1) Z_w[, 1:cuts[1], drop = FALSE]
@@ -179,17 +169,24 @@ mfa_weighted_fabia <- function(Xlist,
   })
   names(weighted_blocks) <- names(Zlist)
   
-  # --- 5) FABIA on weighted data ---
-  # Using standard fabia. 
-  # Note: Lower alpha results in denser loadings (less sparsity).
-  fab_fit <- fabia::fabia(as.matrix(t(Z_w)), p = p, alpha = alpha)
+  # --- D. Run FABIA ---
+  
+  
+  # Transpose because FABIA expects samples in columns
+  fab_fit <- fabia::fabia(as.matrix(t(Z_w)), p = p, alpha = alpha, random = 1)
   
   factor_scores <- t(fab_fit@Z)    
   loadings_all  <- fab_fit@L       
   
-  idx <- split(seq_len(nrow(loadings_all)), rep(seq_along(grp), times = grp))
-  loadings_per_block <- lapply(idx, function(ix) loadings_all[ix, , drop = FALSE])
-  names(loadings_per_block) <- names(Zlist)
+  # Split Loadings per Block based on prefix
+  loadings_per_block <- list()
+  for(n in names(Zlist)) {
+    pattern <- paste0("^", n, "_")
+    idx <- grep(pattern, rownames(loadings_all))
+    if(length(idx) > 0) {
+      loadings_per_block[[n]] <- loadings_all[idx, , drop=FALSE]
+    }
+  }
   
   fab_res <- list(
     FABIA              = fab_fit,
@@ -198,18 +195,19 @@ mfa_weighted_fabia <- function(Xlist,
     group_sizes        = grp
   )
   
-  list(
-    mfa             = mfa,
+  return(list(
+    # mfa object is not strictly created here via FactoMineR anymore, 
+    # but the manual normalization accomplishes the pre-processing.
     weighted        = Z_w,
     weighted_blocks = weighted_blocks,
     fabia           = fab_res,
     weights         = w,
     kurtosis_raw    = kurt_vals
-  )
+  ))
 }
 
 # ==============================================================================
-# 4. EVALUATION HELPERS (UNCHANGED)
+# 4. EVALUATION HELPERS 
 # ==============================================================================
 
 get_true_factors_from_sim <- function(sim_object) {
@@ -275,15 +273,6 @@ evaluate_factor_recovery <- function(sim_object, res, n_factors = NULL, plot = T
   if (plot) {
     pheatmap(cor_mat, main = "Corr. score (true x estimated factors)",
              cluster_rows = FALSE, cluster_cols = FALSE, display_numbers = TRUE)
-    
-    df_list <- lapply(seq_len(K), function(i) {
-      data.frame(sample = seq_len(n), true = trueK[, i], est = est_matched_signed[, i], factor = paste0("True_", i))
-    })
-    g <- ggplot(do.call(rbind, df_list), aes(x = true, y = est)) +
-      geom_point(alpha = 0.6) + facet_wrap(~factor, scales = "free") +
-      geom_smooth(method = "lm", se = FALSE) +
-      labs(title = "True vs Estimated Factors (Matched & Signed)")
-    print(g)
   }
   
   summary_tbl <- data.frame(
@@ -305,6 +294,7 @@ evaluate_loading_recovery <- function(sim_object, fab_res, verbose = TRUE) {
   block_sizes <- vapply(sim_object$omics, ncol, integer(1))
   p_total <- sum(block_sizes)
   
+  # Construct True Loading Matrix
   true_all <- matrix(0, nrow = p_total, ncol = K)
   colnames(true_all) <- paste0("factor", seq_len(K))
   row_start <- 1
@@ -331,9 +321,11 @@ evaluate_loading_recovery <- function(sim_object, fab_res, verbose = TRUE) {
     row_start <- row_end + 1
   }
   
+  # Est loadings
   est_all <- as.matrix(fab_res$FABIA@L)
   K_est <- ncol(est_all); K_use <- min(K, K_est)
   
+  # Align via Hungarian on GLOBAL loadings
   cor_mat <- cor(true_all[, 1:K_use], est_all[, 1:K_use], use = "pairwise.complete.obs")
   abs_cor <- abs(cor_mat); abs_cor[!is.finite(abs_cor)] <- 0
   
@@ -348,8 +340,7 @@ evaluate_loading_recovery <- function(sim_object, fab_res, verbose = TRUE) {
     cc <- suppressWarnings(cor(true_all[, tr], est_all[, es]))
     if (!is.finite(cc)) cc <- 0
     if (cc < 0) { est_all_flipped[, es] <- -est_all_flipped[, es]; cc <- -cc }
-    rmse <- sqrt(mean((true_all[, tr] - est_all_flipped[, es])^2))
-    matched <- rbind(matched, data.frame(true_comp = tr, est_comp = es, cor = cc, rmse = rmse))
+    matched <- rbind(matched, data.frame(true_comp = tr, est_comp = es, cor = cc))
   }
   
   list(true_all = true_all, est_all_flipped = est_all_flipped, cor_mat = cor_mat, 
@@ -358,19 +349,14 @@ evaluate_loading_recovery <- function(sim_object, fab_res, verbose = TRUE) {
 
 
 #' Per-Omic Loading Recovery Analysis
-#' 
-#' Breaks down global loading recovery into specific omics layers.
-#' Handles zero-variance vectors (common in sparse estimation) robustly.
 per_omic_loading_recovery <- function(eval_res, sim_object, plot_heatmaps = TRUE, plot_scatter = TRUE, scatter_n = 5) {
   
-  # Extract global matrices from the previous evaluation result
   true_all <- eval_res$true_all
   est_all_flipped <- eval_res$est_all_flipped
   matched <- eval_res$matched
   block_sizes <- eval_res$block_sizes
   block_names <- names(block_sizes)
   
-  # Define indices for each block
   cuts <- cumsum(block_sizes)
   idx_list <- lapply(seq_along(block_sizes), function(i) {
     if (i == 1) seq_len(cuts[1]) else (cuts[i - 1] + 1):cuts[i]
@@ -384,20 +370,17 @@ per_omic_loading_recovery <- function(eval_res, sim_object, plot_heatmaps = TRUE
     true_block <- true_all[idx, , drop = FALSE]
     est_block <- est_all_flipped[idx, , drop = FALSE]
     
-    # --- ROBUST CORRELATION CALCULATION ---
-    # 1. Identify columns with Zero SD (Constant vectors)
+    # Robust Correlation
     sd_true <- apply(true_block, 2, sd, na.rm = TRUE)
     sd_est  <- apply(est_block, 2, sd, na.rm = TRUE)
     
     valid_true <- sd_true > 1e-12
     valid_est  <- sd_est > 1e-12
     
-    # 2. Initialize Correlation Matrix with Zeros
     cormat_block <- matrix(0, nrow = ncol(true_block), ncol = ncol(est_block))
     rownames(cormat_block) <- colnames(true_block)
     colnames(cormat_block) <- colnames(est_block)
     
-    # 3. Calculate correlation only for valid vectors
     if (any(valid_true) && any(valid_est)) {
       sub_cor <- stats::cor(
         true_block[, valid_true, drop = FALSE], 
@@ -408,8 +391,6 @@ per_omic_loading_recovery <- function(eval_res, sim_object, plot_heatmaps = TRUE
     }
     cormat_block[!is.finite(cormat_block)] <- 0
     
-    # --- PLOTTING ---
-    # 1. Heatmap
     if (plot_heatmaps) {
       pheatmap(cormat_block, 
                cluster_rows = FALSE, cluster_cols = FALSE, 
@@ -417,8 +398,6 @@ per_omic_loading_recovery <- function(eval_res, sim_object, plot_heatmaps = TRUE
                main = paste0("Correlation: ", bname))
     }
     
-    # 2. Scatter Plots (Matched Factors Only)
-    # Filter matches relevant to this block
     matched_in_block <- do.call(rbind, lapply(seq_len(nrow(matched)), function(i) {
       tcomp <- matched$true_comp[i]
       ecomp <- matched$est_comp[i]
@@ -426,113 +405,57 @@ per_omic_loading_recovery <- function(eval_res, sim_object, plot_heatmaps = TRUE
       data.frame(true_comp = tcomp, est_comp = ecomp, cor_block = cor_val)
     }))
     
-    if (plot_scatter && nrow(matched_in_block) > 0) {
-      # Limit to top N scatter plots if requested
-      to_plot <- matched_in_block
-      if (!is.null(scatter_n)) to_plot <- to_plot[seq_len(min(nrow(to_plot), scatter_n)), ]
-      
-      for (ri in seq_len(nrow(to_plot))) {
-        tc <- to_plot$true_comp[ri]; ec <- to_plot$est_comp[ri]
-        
-        df <- data.frame(true = true_block[, tc], est = est_block[, ec])
-        
-        p <- ggplot(df, aes(x = true, y = est)) +
-          geom_point(alpha = 0.4) + 
-          geom_smooth(method = "lm", se = FALSE, color = "blue") +
-          labs(title = sprintf("%s: True Factor %d vs Est %d", bname, tc, ec),
-               subtitle = sprintf("Correlation in this block: %.2f", to_plot$cor_block[ri]),
-               x = "True Loading", y = "Estimated Loading") +
-          theme_minimal()
-        print(p)
-      }
-    }
     per_block_summary[[bname]] <- list(cormat = cormat_block, matched = matched_in_block)
   }
   return(per_block_summary)
 }
 
 # ==============================================================================
-# 5. EXECUTION
+# 5. EXECUTION & EVALUATION
 # ==============================================================================
 
 if (interactive()) {
-  # --- A. Data Simulation ---
-  # (Simulated data logic is preserved from Section 2)
-  sim_object <- sim1
-  sim_object$omics$omic2 <- sim2$omics$omic2
-  sim_object[["list_betas"]][[2]] <- sim2[["list_betas"]][[2]]
-  simX_list <- sim_object$omics
   
-  # PLOT 1: Data Simulation Heatmap
-  plot_simData(sim_object = sim_object, type = "heatmap")
+  message("--- Step 2: Running Method ---")
   
-  # --- B. Run Method (FIXED) ---
-  # Parameters set for:
-  # 1. Kurtosis Weighting (Internal)
-  # 2. Dense Loadings (alpha = 0.01)
-  # 3. p = 3 (number of factors in simulation)
+  # --- Run Method ---
+  # Note: Alpha is set low (0.01) to encourage dense loadings in simulation
   res_kurtosis <- mfa_weighted_fabia(
     simX_list, 
-    gamma = 0.5,    # Standard tempering for kurtosis
+    gamma = 0.5,    
     p = 3, 
-    alpha = 0.01    # VERY LOW alpha to ensure non-zero (dense) loadings
+    alpha = 0.01,
+    block_equalize = TRUE # This now triggers the lambda1 normalization
   )
   
-  # PLOT 2: Basic FABIA plots
-  plot(res_kurtosis$fabia$FABIA, main = "FABIA Results (Kurtosis Weighted)")
-  
-  # PLOT 3: Factor Scores & Loadings
-  factor_scores <- res_kurtosis$fabia$factor_scores
-  factor_loadings <- res_kurtosis$fabia$loadings_per_block
-  plot(factor_scores, main = "Factor Scores")
-  
-  # --- C. Factor Recovery Evaluation ---
-  message("Evaluating Factors...")
+  # --- Factor Recovery ---
+  message("--- Step 3: Evaluating Factors ---")
   eval_factors <- evaluate_factor_recovery(sim_object, res_kurtosis, n_factors = 3, plot = TRUE, return_all = TRUE)
   print(eval_factors$summary)
   
-  # --- D. Loading Recovery Evaluation (Global) ---
-  message("Evaluating Loadings...")
+  # --- Loading Recovery (Global) ---
+  message("--- Step 4: Evaluating Loadings ---")
   eval_loadings <- evaluate_loading_recovery(sim_object, res_kurtosis$fabia, verbose = TRUE)
   
-  # Check density of results (Verification of non-zero request)
-  sparsity_pct <- sum(abs(res_kurtosis$fabia$FABIA@L) > 1e-4) / prod(dim(res_kurtosis$fabia$FABIA@L)) * 100
-  message(sprintf("Loading Density (%% non-zero): %.2f%%", sparsity_pct))
-  
-  # PLOT 4: Global Loading Correlation Heatmap
-  pheatmap(eval_loadings$cor_mat, 
-           cluster_rows = FALSE, 
-           cluster_cols = FALSE, 
-           display_numbers = TRUE, 
-           main = "Global Loading Correlation")
-  
-  # --- E. Per-Omic Loading Recovery (NEW) ---
-  message("Plotting Per-Omic Correlations...")
-  
-  # PLOT 5 & 6: Specific Heatmaps and Scatters for Omic1 and Omic2
+  # --- Per-Omic Loading Recovery ---
+  message("--- Step 5: Per-Omic Correlations ---")
   per_block_res <- per_omic_loading_recovery(
     eval_res = eval_loadings, 
     sim_object = sim_object,
     plot_heatmaps = TRUE, 
-    plot_scatter = TRUE, 
-    scatter_n = 3 # Plot top 3 matched factors per block
+    plot_scatter = FALSE
   )
-  
-  # Check results
-  print(per_block_res$omic1$matched)
-  print(per_block_res$omic2$matched)
 }
 
 
-## --- Feature Selection Overlap (Jaccard Index)
-evaluate_feature_jaccard <- function(sim_object, res, top_n = 500) {
-  # 1. Get True High-Weight Features
-  # Extract true betas from simulation
+# ==============================================================================
+# 6. FEATURE SELECTION OVERLAP (JACCARD)
+# ==============================================================================
+
+evaluate_feature_jaccard <- function(sim_object, res, top_n = 300) {
   eval_load <- evaluate_loading_recovery(sim_object, res$fabia, verbose=FALSE)
   true_L <- eval_load$true_all
   est_L  <- eval_load$est_all_flipped
-  
-  # Use the matched pairs from previous evaluation
   matches <- eval_load$matched
   
   jaccards <- numeric(nrow(matches))
@@ -541,389 +464,222 @@ evaluate_feature_jaccard <- function(sim_object, res, top_n = 500) {
     t_idx <- matches$true_comp[i]
     e_idx <- matches$est_comp[i]
     
-    # Get indices of top N features by absolute weight
     top_true <- order(abs(true_L[, t_idx]), decreasing = TRUE)[1:top_n]
     top_est  <- order(abs(est_L[, e_idx]), decreasing = TRUE)[1:top_n]
     
-    # Calculate Intersection over Union
     intersection <- length(intersect(top_true, top_est))
     union_set    <- length(union(top_true, top_est))
-    
     jaccards[i] <- intersection / union_set
   }
-  
   names(jaccards) <- paste0("Factor_", matches$true_comp)
   return(jaccards)
 }
 
-# Usage:
-j_scores <- evaluate_feature_jaccard(sim_object, res_kurtosis, top_n = 300)
-barplot(j_scores, main="Feature Selection Overlap (Jaccard)", ylim=c(0,1))
+if(interactive()) {
+  j_scores <- evaluate_feature_jaccard(sim_object, res_kurtosis, top_n = 300)
+  barplot(j_scores, main="Feature Selection Overlap (Jaccard)", ylim=c(0,1))
+}
 
-
-## Classification Accuracy (AUC-ROC)
-
-library(pROC)
+# ==============================================================================
+# 7. CLASSIFICATION ACCURACY (AUC-ROC)
+# ==============================================================================
 
 evaluate_sample_auc <- function(sim_object, res, factor_idx_matched) {
-  # 1. Get True Binary Labels (Active vs Inactive samples)
-  # In your simulation, 'list_alphas' contains the true factor activity
   true_factors <- get_true_factors_from_sim(sim_object)
-  
-  # 2. Get Estimated Scores
   est_scores <- res$fabia$factor_scores
-  
   aucs <- numeric()
   
   for(i in seq_along(factor_idx_matched)) {
-    # Match true factor i with estimated factor j (from your Hungarian result)
     est_col <- factor_idx_matched[i]
-    
-    # Create binary label: Signal is present if true value is non-zero (or above threshold)
-    # Note: simulateMultiOmics usually creates continuous factors, 
-    # but we can threshold them to see "Active" samples if the design is sparse.
-    # Alternatively, use the raw true values for correlation, but here we want classification.
     true_binary <- abs(true_factors[, i]) > 1e-3 
     
     if(length(unique(true_binary)) > 1) {
-      # Calculate ROC
       roc_obj <- pROC::roc(true_binary, est_scores[, est_col], quiet=TRUE)
       aucs[i] <- roc_obj$auc
     } else {
-      aucs[i] <- NA # Skip if factor is active in ALL or NO samples
+      aucs[i] <- NA 
     }
   }
   return(aucs)
 }
 
-# Usage:
-matched_indices <- eval_factors$summary$matched_idx 
-auc_scores <- evaluate_sample_auc(sim_object, res_kurtosis, matched_indices)
-print(auc_scores)
-
-
-# ---- Reconstruction Error (RMSE)
-evaluate_reconstruction <- function(Xlist, res) {
-  # 1. Combine Original Data (Centered/Scaled)
-  # We must replicate the preprocessing used inside the function
-  Zlist <- lapply(Xlist, function(x) scale(as.matrix(x)))
-  Zlist <- Map(function(Z, k) Z / sqrt(k), Zlist, lapply(Zlist, ncol))
-  X_orig <- do.call(cbind, Zlist)
-  
-  # 2. Reconstruct Data from Model
-  # X_hat = Scores * Loadings^T
-  Scores <- as.matrix(res$fabia$factor_scores)
-  Loadings <- as.matrix(res$fabia$FABIA@L)
-  
-  X_hat <- Scores %*% t(Loadings)
-  
-  # 3. Calculate Residuals
-  Residuals <- X_orig - X_hat
-  RMSE <- sqrt(mean(Residuals^2))
-  
-  # Optional: Variance Explained
-  var_total <- sum(X_orig^2)
-  var_resid <- sum(Residuals^2)
-  R2_global <- 1 - (var_resid / var_total)
-  
-  return(list(RMSE = RMSE, R2_global = R2_global))
+if(interactive()) {
+  matched_indices <- eval_factors$summary$matched_idx 
+  auc_scores <- evaluate_sample_auc(sim_object, res_kurtosis, matched_indices)
+  print(data.frame(Factor = 1:length(auc_scores), AUC = auc_scores))
 }
-
-# Usage:
-recon_stats <- evaluate_reconstruction(simX_list, res_kurtosis)
-cat(sprintf("Global Variance Explained: %.2f%%\n", recon_stats$R2_global * 100))
 
 
 # ==============================================================================
 # 8. PER-FACTOR SNR TREND ANALYSIS
 # ==============================================================================
 
-# 1. Define range: 0.01 to 2.0 with steps of 0.05
-snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
-
-# Initialize storage
-factor_results <- data.frame(
-  SNR = numeric(),
-  Omic = character(),
-  Factor = character(),
-  Best_Correlation = numeric(),
-  stringsAsFactors = FALSE
-)
-
-message(sprintf("Analyzing Factor-Specific Recovery across %d SNR steps...", length(snr_values)))
-pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
-
-for (i in seq_along(snr_values)) {
-  s <- snr_values[i]
-  setTxtProgressBar(pb, i)
+if(interactive()) {
   
-  # --- A. Re-simulate Data ---
-  # We use the same structure as before
-  sim1_s <- simulateMultiOmics(
-    vector_features = c(4000, 2500), n_samples = 100, n_factors = 3,
-    snr = s, 
-    signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
-    factor_structure = "mixed", num.factor = "multiple", seed = 123
-  )
-  sim2_s <- simulateMultiOmics(
-    vector_features = c(4000, 3500), n_samples = 100, n_factors = 3,
-    snr = s,
-    signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
-    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  # 1. Define range: 0.01 to 2.0 with steps
+  snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
+  
+  factor_results <- data.frame(
+    SNR = numeric(), Omic = character(), Factor = character(),
+    Best_Correlation = numeric(), stringsAsFactors = FALSE
   )
   
-  sim_obj_s <- sim1_s
-  sim_obj_s$omics$omic2 <- sim2_s$omics$omic2
-  sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
-  simX_s <- sim_obj_s$omics
-  names(simX_s) <- paste0("omic", seq_along(simX_s))
+  message(sprintf("Analyzing Factor-Specific Recovery across %d SNR steps...", length(snr_values)))
+  pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
   
-  # --- B. Run Sparse MFA-FABIA ---
-  res_s <- suppressMessages(
-    mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1)
-  )
-  
-  # --- C. Get Correlation Matrices ---
-  eval_load_s <- evaluate_loading_recovery(sim_obj_s, res_s$fabia, verbose = FALSE)
-  per_omic_s <- per_omic_loading_recovery(
-    eval_res = eval_load_s, sim_object = sim_obj_s, 
-    plot_heatmaps = FALSE, plot_scatter = FALSE
-  )
-  
-  # --- D. Extract Max Correlation PER FACTOR ---
-  
-  # Function to extract best match for each row (True Factor)
-  extract_best_matches <- function(omic_res, omic_name, snr_val) {
-    cormat <- omic_res$cormat
-    # Iterate through True Factors (Rows of the correlation matrix)
-    if (!is.null(cormat) && nrow(cormat) > 0) {
-      for (f_idx in 1:nrow(cormat)) {
-        # Find the single highest absolute correlation in this row
-        best_val <- max(abs(cormat[f_idx, ]), na.rm = TRUE)
-        
-        # Append to global dataframe
-        factor_results <<- rbind(factor_results, data.frame(
-          SNR = snr_val,
-          Omic = omic_name,
-          Factor = rownames(cormat)[f_idx], # e.g., "factor1"
-          Best_Correlation = best_val
-        ))
+  for (i in seq_along(snr_values)) {
+    s <- snr_values[i]
+    setTxtProgressBar(pb, i)
+    
+    # A. Re-simulate
+    sim1_s <- simulateMultiOmics(
+      vector_features = c(4000, 2500), n_samples = 100, n_factors = 3, snr = s, 
+      signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
+      factor_structure = "mixed", num.factor = "multiple", seed = 123
+    )
+    sim2_s <- simulateMultiOmics(
+      vector_features = c(4000, 3500), n_samples = 100, n_factors = 3, snr = s,
+      signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
+      factor_structure = "mixed", num.factor = "multiple", seed = 123
+    )
+    sim_obj_s <- sim1_s
+    sim_obj_s$omics$omic2 <- sim2_s$omics$omic2
+    sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
+    simX_s <- sim_obj_s$omics
+    names(simX_s) <- paste0("omic", seq_along(simX_s))
+    
+    # B. Run Method (Corrected Logic)
+    res_s <- suppressMessages(
+      mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1)
+    )
+    
+    # C. Evaluate
+    eval_load_s <- evaluate_loading_recovery(sim_obj_s, res_s$fabia, verbose = FALSE)
+    per_omic_s <- per_omic_loading_recovery(eval_res = eval_load_s, sim_object = sim_obj_s, 
+                                            plot_heatmaps = FALSE, plot_scatter = FALSE)
+    
+    # D. Extract Max
+    extract_best_matches <- function(omic_res, omic_name, snr_val) {
+      cormat <- omic_res$cormat
+      if (!is.null(cormat) && nrow(cormat) > 0) {
+        for (f_idx in 1:nrow(cormat)) {
+          best_val <- max(abs(cormat[f_idx, ]), na.rm = TRUE)
+          factor_results <<- rbind(factor_results, data.frame(
+            SNR = snr_val, Omic = omic_name, 
+            Factor = rownames(cormat)[f_idx], Best_Correlation = best_val
+          ))
+        }
       }
     }
+    extract_best_matches(per_omic_s$omic1, "Omic1", s)
+    extract_best_matches(per_omic_s$omic2, "Omic2", s)
   }
+  close(pb)
   
-  # Run extraction for both omics
-  extract_best_matches(per_omic_s$omic1, "Omic1", s)
-  extract_best_matches(per_omic_s$omic2, "Omic2", s)
+  # Plot
+  factor_results$Factor <- factor(factor_results$Factor, levels = c("factor1", "factor2", "factor3"))
+  p_snr <- ggplot(factor_results, aes(x = SNR, y = Best_Correlation, color = Factor)) +
+    facet_wrap(~Omic) + 
+    geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
+    geom_point(size = 1.5, alpha = 0.6) +
+    scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
+    scale_y_continuous(limits = c(0, 1.05)) +
+    labs(title = "Factor Recovery vs SNR", y = "Max Correlation") +
+    theme_minimal()
+  
+  print(p_snr)
 }
-close(pb)
+
 
 # ==============================================================================
-# 9. PLOTTING
+# 9. JACCARD INDEX TREND ANALYSIS 
 # ==============================================================================
 
-# Clean factor names for plotting (optional)
-factor_results$Factor <- factor(factor_results$Factor, levels = c("factor1", "factor2", "factor3"))
-
-ggplot(factor_results, aes(x = SNR, y = Best_Correlation, color = Factor)) +
-  # Facet by Omic so we can see differences between layers
-  facet_wrap(~Omic) + 
-  geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
-  #geom_line(alpha = 0.7, size = 1) +
-  geom_point(size = 1.5, alpha = 0.6) +
-  scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
-  scale_x_continuous(breaks = seq(0, 2, 0.5)) +
-  scale_y_continuous(limits = c(0, 1.05)) +
-  labs(
-    title = "Differential Factor Recovery Analysis",
-    subtitle = "Tracking the single best bicluster match for each True Factor",
-    x = "Signal-to-Noise Ratio (SNR)",
-    y = "Max Correlation (Recovery Score)"
-  ) +
-  theme_minimal() +
-  theme(
-    strip.text = element_text(face = "bold", size = 12),
-    legend.position = "bottom"
-  )
-
-
-
-
-##############################################################
-# ==============================================================================
-# 10. JACCARD INDEX TREND ANALYSIS 
-# ==============================================================================
-
-# 1. Define range and parameters
-snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
-top_n_features <- 400  # Number of top features to compare
-
-# Initialize storage
-jaccard_results <- data.frame(
-  SNR = numeric(),
-  Omic = character(),
-  Factor = character(),
-  Jaccard_Index = numeric(),
-  stringsAsFactors = FALSE
-)
-
-message(sprintf("Analyzing Jaccard Overlap (Top %d) across %d SNR steps...", 
-                top_n_features, length(snr_values)))
-pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
-
-for (i in seq_along(snr_values)) {
-  s <- snr_values[i]
-  setTxtProgressBar(pb, i)
+if(interactive()) {
   
-  # --- A. Re-simulate Data ---
-  sim1_s <- simulateMultiOmics(
-    vector_features = c(4000, 2500), n_samples = 100, n_factors = 3,
-    snr = s, 
-    signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)),
-    factor_structure = "mixed", num.factor = "multiple", seed = 123
-  )
-  sim2_s <- simulateMultiOmics(
-    vector_features = c(4000, 3500), n_samples = 100, n_factors = 3,
-    snr = s,
-    signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)),
-    factor_structure = "mixed", num.factor = "multiple", seed = 123
+  snr_values <- seq(from = 0.01, to = 2.0, by = 0.4)
+  top_n_features <- 400 
+  
+  jaccard_results <- data.frame(
+    SNR = numeric(), Omic = character(), Factor = character(),
+    Jaccard_Index = numeric(), stringsAsFactors = FALSE
   )
   
-  sim_obj_s <- sim1_s
-  sim_obj_s$omics$omic2 <- sim2_s$omics$omic2
-  sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
-  simX_s <- sim_obj_s$omics
-  names(simX_s) <- paste0("omic", seq_along(simX_s))
+  message(sprintf("Analyzing Jaccard Overlap (Top %d) across %d SNR steps...", 
+                  top_n_features, length(snr_values)))
+  pb <- txtProgressBar(min = 0, max = length(snr_values), style = 3)
   
-  # --- B. Run Sparse MFA-FABIA ---
-  res_s <- suppressMessages(
-    mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1)
-  )
-  
-  # --- C. ROBUST Helper to Get True Loadings per Block ---
-  # This ensures that "beta2" from simulation always goes to Column 2 (Factor 2)
-  # preventing color/label mismatch when Factor 1 is missing.
-  get_true_block_robust <- function(sim_obj, block_idx, n_global_factors = 3) {
-    betas_list <- sim_obj$list_betas[[block_idx]]
+  for (i in seq_along(snr_values)) {
+    s <- snr_values[i]
+    setTxtProgressBar(pb, i)
     
-    # Determine number of features (rows) from the first available vector
-    if (length(betas_list) > 0) {
+    # A. Re-simulate
+    sim1_s <- simulateMultiOmics(vector_features = c(4000, 2500), n_samples = 100, n_factors = 3, snr = s, signal.samples = c(3, 1), signal.features = list(c(4.5, 0.5), c(4.5, 0.5)), factor_structure = "mixed", num.factor = "multiple", seed = 123)
+    sim2_s <- simulateMultiOmics(vector_features = c(4000, 3500), n_samples = 100, n_factors = 3, snr = s, signal.samples = c(3, 1), signal.features = list(c(2.5, 0.5), c(3, 2.5)), factor_structure = "mixed", num.factor = "multiple", seed = 123)
+    sim_obj_s <- sim1_s; sim_obj_s$omics$omic2 <- sim2_s$omics$omic2; sim_obj_s[["list_betas"]][[2]] <- sim2_s[["list_betas"]][[2]]
+    simX_s <- sim_obj_s$omics; names(simX_s) <- paste0("omic", seq_along(simX_s))
+    
+    # B. Run Method
+    res_s <- suppressMessages(mfa_weighted_fabia(simX_s, gamma = 0.5, p = 3, alpha = 0.01, seed = 1))
+    
+    # C. Jaccard Helper
+    get_true_block_robust <- function(sim_obj, block_idx, n_global_factors = 3) {
+      betas_list <- sim_obj$list_betas[[block_idx]]
+      if (length(betas_list) == 0) return(NULL)
       n_features <- length(betas_list[[1]])
-    } else {
-      return(NULL)
-    }
-    
-    # Initialize matrix of ZEROS for ALL global factors (1 to 3)
-    mat_out <- matrix(0, nrow = n_features, ncol = n_global_factors)
-    colnames(mat_out) <- paste0("factor", 1:n_global_factors)
-    
-    # Populate columns based on names (e.g., "beta2" -> Column 2)
-    if (is.list(betas_list)) {
-      names_betas <- names(betas_list)
-      for (nm in names_betas) {
-        # Extract index from string "betaX"
-        if (grepl("beta", nm)) {
-          idx <- as.integer(sub("beta", "", nm))
-        } else {
-          idx <- as.integer(nm) # Fallback
-        }
-        
-        # If valid index, fill the specific column
-        if (!is.na(idx) && idx <= n_global_factors) {
-          mat_out[, idx] <- as.numeric(betas_list[[nm]])
-        }
-      }
-    } else if (is.matrix(betas_list)) {
-      # If already a matrix, fill safely
-      k <- min(ncol(betas_list), n_global_factors)
-      mat_out[, 1:k] <- betas_list[, 1:k]
-    }
-    
-    return(mat_out)
-  }
-  
-  # --- D. Calculate Jaccard per Omic / per Factor ---
-  
-  process_jaccard <- function(omic_name, block_idx) {
-    # 1. Get True Matrix (Robust)
-    true_mat <- get_true_block_robust(sim_obj_s, block_idx, n_global_factors = 3)
-    if (is.null(true_mat)) return(NULL)
-    
-    # Get Estimated Loadings
-    if (!omic_name %in% names(res_s$fabia$loadings_per_block)) return(NULL)
-    est_mat <- res_s$fabia$loadings_per_block[[omic_name]]
-    
-    # 2. Match and Calculate
-    if (ncol(est_mat) > 0) {
-      cormat <- cor(true_mat, est_mat, use="pairwise.complete.obs")
-      cormat[is.na(cormat)] <- 0
+      mat_out <- matrix(0, nrow = n_features, ncol = n_global_factors)
+      colnames(mat_out) <- paste0("factor", 1:n_global_factors)
       
-      # Iterate through Global Factors (1, 2, 3)
-      for (f in 1:ncol(true_mat)) {
-        fname <- colnames(true_mat)[f]
-        
-        # SKIP empty true factors (if signal is zero, Jaccard is meaningless)
-        # We record 0 to keep the plot lines consistent
-        if (sd(true_mat[, f]) < 1e-6) {
-          jaccard_results <<- rbind(jaccard_results, data.frame(
-            SNR = s, Omic = omic_name, Factor = fname, Jaccard_Index = 0
-          ))
-          next
+      if (is.list(betas_list)) {
+        for (nm in names(betas_list)) {
+          idx <- if (grepl("beta", nm)) as.integer(sub("beta", "", nm)) else as.integer(nm)
+          if (!is.na(idx) && idx <= n_global_factors) mat_out[, idx] <- as.numeric(betas_list[[nm]])
         }
+      }
+      return(mat_out)
+    }
+    
+    process_jaccard <- function(omic_name, block_idx) {
+      true_mat <- get_true_block_robust(sim_obj_s, block_idx, n_global_factors = 3)
+      if (is.null(true_mat) || !omic_name %in% names(res_s$fabia$loadings_per_block)) return(NULL)
+      est_mat <- res_s$fabia$loadings_per_block[[omic_name]]
+      
+      if (ncol(est_mat) > 0) {
+        cormat <- cor(true_mat, est_mat, use="pairwise.complete.obs")
+        cormat[is.na(cormat)] <- 0
         
-        # Find best estimated match
-        best_match_idx <- which.max(abs(cormat[f, ]))
-        
-        if (length(best_match_idx) > 0) {
-          v_true <- true_mat[, f]
-          v_est  <- est_mat[, best_match_idx]
-          
-          top_true <- order(abs(v_true), decreasing = TRUE)[1:top_n_features]
-          top_est  <- order(abs(v_est), decreasing = TRUE)[1:top_n_features]
-          
-          intersect_len <- length(intersect(top_true, top_est))
-          union_len     <- length(union(top_true, top_est))
-          
-          j_val <- if(union_len > 0) intersect_len / union_len else 0
-          
-          jaccard_results <<- rbind(jaccard_results, data.frame(
-            SNR = s, Omic = omic_name, Factor = fname, Jaccard_Index = j_val
-          ))
+        for (f in 1:ncol(true_mat)) {
+          if (sd(true_mat[, f]) < 1e-6) {
+            jaccard_results <<- rbind(jaccard_results, data.frame(SNR = s, Omic = omic_name, Factor = colnames(true_mat)[f], Jaccard_Index = 0))
+            next
+          }
+          best_match_idx <- which.max(abs(cormat[f, ]))
+          if (length(best_match_idx) > 0) {
+            top_true <- order(abs(true_mat[, f]), decreasing = TRUE)[1:top_n_features]
+            top_est  <- order(abs(est_mat[, best_match_idx]), decreasing = TRUE)[1:top_n_features]
+            j_val <- length(intersect(top_true, top_est)) / length(union(top_true, top_est))
+            jaccard_results <<- rbind(jaccard_results, data.frame(SNR = s, Omic = omic_name, Factor = colnames(true_mat)[f], Jaccard_Index = j_val))
+          }
         }
       }
     }
+    
+    process_jaccard("omic1", 1)
+    process_jaccard("omic2", 2)
   }
+  close(pb)
   
-  process_jaccard("omic1", 1)
-  process_jaccard("omic2", 2)
+  jaccard_results$Factor <- factor(jaccard_results$Factor, levels = c("factor1", "factor2", "factor3"))
+  
+  p_jac <- ggplot(jaccard_results, aes(x = SNR, y = Jaccard_Index, color = Factor)) +
+    facet_wrap(~Omic) + 
+    geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
+    geom_point(size = 1.5, alpha = 0.6) +
+    scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
+    scale_y_continuous(limits = c(0, 1.0)) +
+    labs(title = "Jaccard Index vs SNR", y = "Jaccard Index") +
+    theme_minimal()
+  
+  print(p_jac)
 }
-close(pb)
-
-# ==============================================================================
-# 11. PLOTTING JACCARD TREND
-# ==============================================================================
-
-# Ensure factors are ordered for the legend
-jaccard_results$Factor <- factor(jaccard_results$Factor, levels = c("factor1", "factor2", "factor3"))
-
-ggplot(jaccard_results, aes(x = SNR, y = Jaccard_Index, color = Factor)) +
-  facet_wrap(~Omic) + 
-  geom_smooth(method = "loess", se = FALSE, alpha = 0.2, size = 0.8) +
-  # geom_line(alpha = 0.7, size = 1) +
-  geom_point(size = 1.5, alpha = 0.6) +
-  scale_color_manual(values = c("factor1" = "#E41A1C", "factor2" = "#377EB8", "factor3" = "#4DAF4A")) +
-  scale_x_continuous(breaks = seq(0, 2, 0.5)) +
-  scale_y_continuous(limits = c(0, 1.0), breaks = seq(0, 1, 0.1)) +
-  labs(
-    title = "Feature Selection Overlap (Jaccard Index) vs. SNR",
-    subtitle = sprintf("Comparison of Top %d loaded features (True vs Best Estimated Match)", top_n_features),
-    x = "Signal-to-Noise Ratio (SNR)",
-    y = "Jaccard Index (Intersection / Union)"
-  ) +
-  theme_minimal() +
-  theme(
-    strip.text = element_text(face = "bold", size = 12),
-    legend.position = "bottom"
-  )
-
 
