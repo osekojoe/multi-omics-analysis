@@ -221,10 +221,53 @@ res_hybrid <- mfa_weighted_fabia(X_list,
                                  block_equalize = TRUE,
                                  scale_vars = TRUE)
 
-# Visualize Scores Heatmap
-pheatmap(res_hybrid$factor_scores, cluster_cols = FALSE, display_numbers = TRUE,
-         main = "Factor Scores (Sample Activity)")
+# ==============================================================================
+# VISUALIZATION: Annotated Factor Scores
+# ==============================================================================
 
+message("Generating annotated factor score heatmap")
+
+# 1. load metadata
+if(!exists("D17_metadata")) {
+  D17_metadata <- read.csv(file = "../multi-omics radiation_data/D17_metadata.csv",
+                           header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+# 2. Prepare Annotation Dataframe
+# The heatmap has Samples as Rows ("X13", "X15"). We need a dataframe 
+# where rownames match the heatmap exactly.
+
+heatmap_data <- res_hybrid$factor_scores # ((Samples x Factors))
+
+# Clean "X" prefix to match metadata IDs (e.g. "X13" -> 13)
+clean_ids <- as.integer(sub("^X", "", rownames(heatmap_data)))
+
+# Match IDs to find the correct metadata row for each sample
+meta_idx <- match(clean_ids, D17_metadata$Internal.ID)
+
+# Create the annotation table
+annot_df <- data.frame(
+  Description = as.factor(D17_metadata$Description[meta_idx]),
+  Treatment   = as.factor(D17_metadata$Treatment[meta_idx]),
+  Control     = as.factor(D17_metadata$Control[meta_idx])
+)
+
+# Row names of annotation must match heatmap row names
+rownames(annot_df) <- rownames(heatmap_data)
+
+# 3. Define Custom Colors 
+ann_colors <- list(
+  Treatment = c("TRUE" = "#E41A1C", "FALSE" = "#F0F0F0"), # Red for Treated
+  Control   = c("TRUE" = "#4DAF4A", "FALSE" = "#F0F0F0")  # Green for Control
+)
+
+pheatmap(heatmap_data,
+         cluster_cols = FALSE,      # Don't reorder Factors (keep 1, 2, 3, 4)
+         cluster_rows = TRUE,       # Cluster Samples to see which group together
+         display_numbers = TRUE,    # Show score values
+         annotation_row = annot_df,     
+         annotation_colors = ann_colors, 
+         main = "Factor Scores (sample activity)")
 
 
 
@@ -288,7 +331,7 @@ my_theme <- theme_minimal() +
 p1 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, label = SampleLabel)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
-  geom_point(size = 4, alpha = 0.7, color = "black") + 
+  geom_point(size = 2, alpha = 0.7, color = "black") + 
   geom_text(vjust = -0.8, size = 3) +
   labs(title = "1. Scores (ungrouped)", x="Factor 1", y="Factor 2") +
   my_theme
@@ -297,7 +340,7 @@ p1 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, label = SampleLabel)) 
 p2 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Description, label = SampleLabel)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
-  geom_point(size = 4, alpha = 0.8) +
+  geom_point(size = 2, alpha = 0.8) +
   labs(title = "2. Scores by 'Description'", x="Factor 1", y="Factor 2") +
   my_theme
 
@@ -305,7 +348,7 @@ p2 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Description, l
 p3 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Control, label = SampleLabel)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
-  geom_point(size = 4, alpha = 0.8) +
+  geom_point(size = 2, alpha = 0.8) +
   labs(title = "3. Scores by 'Control'", x="Factor 1", y="Factor 2") +
   my_theme
 
@@ -313,7 +356,7 @@ p3 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Control, label
 p4 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Treatment, label = SampleLabel)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
   geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
-  geom_point(size = 4, alpha = 0.8) +
+  geom_point(size = 2, alpha = 0.8) +
   labs(title = "4. Scores by 'Treatment'", x="Factor 1", y="Factor 2") +
   my_theme
 
