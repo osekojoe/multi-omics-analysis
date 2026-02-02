@@ -504,31 +504,95 @@ grid.arrange(grobs = plot_list, ncol = 2, top = "Top 20 Features per Factor (Ran
 
 # ==============================================================================
 # VISUALIZATION B: Clustered Heatmap of Top Features
+### LOADING HEATMAPS (Global & Per-Omic)
 # ==============================================================================
 # Goal: Check specificity. Do Factor 1 genes also light up in Factor 2?
 
-# 1. Extract Top 50 features from EACH factor and combine them
-top_features_indices <- unique(unlist(lapply(1:ncol(res_hybrid$factor_scores), function(i) {
-  order(abs(res_hybrid$loadings[,i]), decreasing = TRUE)[1:50]
-})))
+message("Generating Unified Loading Heatmaps...")
 
-# 2. Subset the Loading Matrix
-loading_subset <- res_hybrid$loadings[top_features_indices, ]
+#' Plot a Clustered Heatmap of Top Loadings
+#' 
+#' @param loading_matrix Matrix of feature loadings (Features x Factors)
+#' @param title_text Main title for the plot
+#' @param top_n Number of top features per factor to select
+#' @param annotate_type Boolean. If TRUE, adds an "mRNA/Protein" annotation bar 
+#'        and hides row names (best for Global plots). If FALSE, strips prefixes 
+#'        and shows row names (best for Per-Omic plots).
+plot_loading_heatmap <- function(loading_matrix, title_text, top_n = 50, annotate_type = FALSE) {
+  
+  # 1. Identify Top N features for EACH factor
+  # Loop through columns (Factors) and find indices of highest absolute weights
+  top_indices <- unique(unlist(lapply(1:ncol(loading_matrix), function(i) {
+    order(abs(loading_matrix[, i]), decreasing = TRUE)[1:top_n]
+  })))
+  
+  # 2. Subset the matrix
+  subset_mat <- loading_matrix[top_indices, , drop = FALSE]
+  
+  # 3. Configure Annotation & Row Names
+  annot_row <- NA
+  annot_col <- NA
+  show_rows <- TRUE
+  
+  if(annotate_type) {
+    # --- Global Mode ---
+    # Create "Type" annotation based on row prefixes
+    types <- ifelse(grepl("^mRNA_", rownames(subset_mat)), "mRNA", "Protein")
+    annot_row <- data.frame(Type = factor(types))
+    rownames(annot_row) <- rownames(subset_mat)
+    annot_col <- list(Type = c(mRNA = "#1f77b4", Protein = "#ff7f0e"))
+    
+    # Hide row names because 200+ mixed genes/proteins are too crowded
+    show_rows <- FALSE 
+  } else {
+    # --- Per-Omic Mode ---
+    # Clean prefixes (e.g., "mRNA_GeneA" -> "GeneA") for readability
+    rownames(subset_mat) <- sub("^mRNA_|^Protein_", "", rownames(subset_mat))
+    show_rows <- TRUE
+  }
+  
+  # 4. Define Dynamic Color Limits
+  # Scales the color palette to the data's specific range (crucial for Protein vs mRNA)
+  limit <- max(abs(subset_mat))
+  breaks_list <- seq(-limit, limit, length.out = 100)
+  
+  # 5. Render Heatmap
+  pheatmap(subset_mat,
+           color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+           breaks = breaks_list,
+           annotation_row = annot_row,
+           annotation_colors = annot_col,
+           cluster_cols = FALSE,       # Keep Factors ordered (1, 2, 3...)
+           cluster_rows = TRUE,        # Cluster features to show shared patterns
+           show_rownames = show_rows,
+           fontsize_row = 4,
+           main = paste0(title_text, " (Union of Top ", top_n, " per Factor)"))
+}
 
-# 3. Create Annotation for Rows (Omic Type)
-type_annot <- data.frame(Type = ifelse(grepl("^mRNA_", rownames(loading_subset)), "mRNA", "Protein"))
-rownames(type_annot) <- rownames(loading_subset)
+# --- EXECUTE PLOTS ---
 
-# 4. Render Heatmap
-# We use a divergent palette: Blue (-) ... White (0) ... Red (+)
-pheatmap(loading_subset,
-         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
-         breaks = seq(-max(abs(loading_subset)), max(abs(loading_subset)), length.out = 100),
-         annotation_row = type_annot,
-         annotation_colors = list(Type = c(mRNA="#1f77b4", Protein="#ff7f0e")),
-         show_rownames = FALSE, # Hide names if too crowded
-         cluster_cols = FALSE,  # Keep Factors ordered 1..4
-         main = "Heatmap of Top Loaded Features (Union of Top 50 per Factor)")
+# 1. Global Heatmap (Combined mRNA & Protein)
+# shows broad patterns and omic-specificity (via annotation bar)
+plot_loading_heatmap(res_hybrid$loadings, 
+                     "Global Top Loadings", 
+                     top_n = 50, 
+                     annotate_type = TRUE)
+
+
+
+# 2. mRNA Heatmap (Specific Transcriptomic Drivers)
+# shows specific gene names
+plot_loading_heatmap(res_hybrid$loadings_per_block$mRNA, 
+                     "mRNA Top Loadings", 
+                     top_n = 50, 
+                     annotate_type = FALSE)
+
+# 3. Protein Heatmap (Specific Proteomic Drivers)
+# re-scaled color bar reveals subtle protein patterns invisible in the global plot
+plot_loading_heatmap(res_hybrid$loadings_per_block$Protein, 
+                     "Protein Top Loadings", 
+                     top_n = 50, 
+                     annotate_type = FALSE)
 
 
 # ==============================================================================
