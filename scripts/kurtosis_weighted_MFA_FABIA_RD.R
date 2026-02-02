@@ -396,6 +396,59 @@ p41 <- ggplot(scores_merged, aes(x = Factor3, y = Factor4, color = Treatment, la
 grid.arrange(p11, p21, p31, p41, nrow = 2)
 
 
+# ==============================================================================
+# PART 2: Factor Scan Plots (All Factors vs Samples)
+# Plots for factor scores v samples; for each factor
+# ==============================================================================
+
+long_scores <- melt(scores_merged,
+                    id.vars = c("SampleLabel", "Description", "Control", "Treatment"),
+                    measure.vars = colnames(scores_df)[grep("Factor", colnames(scores_df))],
+                    variable.name = "Factor", 
+                    value.name = "Score")
+
+# Define Plotting Function
+plot_factor_scan <- function(data, group_col, title_text) {
+  
+  # 1. Determine Sample Order based on UNIQUE samples
+  # (Sort by Group first, then by Sample Name)
+  unique_meta <- unique(data[, c("SampleLabel", group_col)])
+  unique_meta <- unique_meta[order(unique_meta[[group_col]], unique_meta$SampleLabel), ]
+  
+  # 2. Apply this unique order
+  data$OrderedSample <- factor(data$SampleLabel, levels = unique_meta$SampleLabel)
+  
+  # 3. Plot
+  ggplot(data, aes(x = OrderedSample, y = Score, color = .data[[group_col]])) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_segment(aes(x = OrderedSample, xend = OrderedSample, y = 0, yend = Score), alpha=0.5) +
+    geom_point(size = 3, alpha = 0.9) +
+    
+    # Facet by Factor (Show F1, F2, F3, F4)     
+    facet_wrap(~Factor, ncol = 2, scales = "free_y") +
+    
+    labs(title = title_text,
+         subtitle = "Ordered by Group",
+         x = "Samples", 
+         y = "Factor Score") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size=8),
+          strip.text = element_text(face = "bold", size = 10))
+}
+
+# 5) Scan by 'Control'
+p5 <- plot_factor_scan(long_scores, "Control", "5. Factor Scan: Control")
+
+# 6) Scan by 'Treatment'
+p6 <- plot_factor_scan(long_scores, "Treatment", "6. Factor Scan: Treatment")
+
+# 7) Scan by 'Description'
+p7 <- plot_factor_scan(long_scores, "Description", "7. Factor Scan: Description")
+
+# Display Part 2
+print(p5)
+print(p6)
+print(p7)
 
 
 # ==============================================================================
