@@ -283,28 +283,33 @@ message("--- Step 4: Generating Scatter Plots ---")
 D17_metadata <- read.csv(file = "../multi-omics radiation_data/D17_metadata.csv",
                          header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
 
-# --- B. Prepare Score Data ---
 scores_df <- as.data.frame(res_hybrid$factor_scores)
 colnames(scores_df) <- paste0("Factor", 1:ncol(scores_df))
 
-# --- C. ALIGNMENT (Match "X13" to 13) ---
+# Clean ID: Remove "X" prefix and ensure integer match
+scores_df$ID_clean <- as.integer(sub("^X", "", rownames(scores_df)))
 
-# 1. Clean the Sample IDs from the analysis (remove "X" prefix if present)
-# "X13" -> "13"
-scores_df$ID_clean <- sub("^X", "", rownames(scores_df))
-
-# 2. Ensure IDs are the same data type (Integers) for merging
-scores_df$ID_clean <- as.integer(scores_df$ID_clean)
-
-# --- D. Merge Data ---
-# Merge based on the cleaned ID from scores and 'Internal.ID' from metadata
+# Merge
 scores_merged <- merge(
   x = scores_df, 
   y = D17_metadata, 
-  by.x = "ID_clean",      # The cleaned ID (e.g., 13)
-  by.y = "Internal.ID",   # The integer ID in metadata (e.g., 13)
-  all.x = TRUE            # Keep all samples from analysis
+  by.x = "ID_clean", 
+  by.y = "Internal.ID", 
+  all.x = TRUE
 )
+
+# Add Label back
+scores_merged$SampleLabel <- rownames(scores_df)[match(scores_merged$ID_clean, scores_df$ID_clean)]
+
+# convert groups to factors
+scores_merged$Description <- as.factor(scores_merged$Description)
+scores_merged$Control     <- as.factor(scores_merged$Control)
+scores_merged$Treatment   <- as.factor(scores_merged$Treatment)
+
+# --- B. Define Theme ---
+my_theme <- theme_minimal() +
+  theme(plot.title = element_text(face="bold", size=12),
+        legend.position = "right")
 
 # Check if merge worked
 if(nrow(scores_merged) == 0) {
@@ -313,19 +318,9 @@ if(nrow(scores_merged) == 0) {
   message(sprintf("Successfully merged metadata for %d samples.", nrow(scores_merged)))
 }
 
-# Add Sample Label (Original "X13" style name for plotting)
-scores_merged$SampleLabel <- rownames(scores_df)[match(scores_merged$ID_clean, scores_df$ID_clean)]
-
-# Convert grouping columns to factors
-scores_merged$Description <- as.factor(scores_merged$Description)
-scores_merged$Control     <- as.factor(scores_merged$Control)
-scores_merged$Treatment   <- as.factor(scores_merged$Treatment)
-
-# --- E. Generate Plots ---
-
-my_theme <- theme_minimal() +
-  theme(plot.title = element_text(face="bold", size=12),
-        legend.position = "right")
+# ==============================================================================
+# PART 1: Standard Scatter Plots (Factor 1 vs Factor 2)
+# ==============================================================================
 
 # 1) Scatter Plot: NO GROUPING
 p1 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, label = SampleLabel)) +
@@ -360,14 +355,45 @@ p4 <- ggplot(scores_merged, aes(x = Factor1, y = Factor2, color = Treatment, lab
   labs(title = "4. Scores by 'Treatment'", x="Factor 1", y="Factor 2") +
   my_theme
 
-# --- F. Print Plots ---
-print(p1)
-print(p2)
-print(p3)
-print(p4)
-
-# 2x2 grid 
+# Display Part 1
 grid.arrange(p1, p2, p3, p4, nrow = 2)
+
+
+# 1) Scatter Plot: NO GROUPING
+p11 <- ggplot(scores_merged, aes(x = Factor3, y = Factor4, label = SampleLabel)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(size = 2, alpha = 0.7, color = "black") + 
+  geom_text(vjust = -0.8, size = 3) +
+  labs(title = "1. Scores (ungrouped)", x="Factor 3", y="Factor 4") +
+  my_theme
+
+# 2) Scatter Plot: Grouped by 'Description'
+p21 <- ggplot(scores_merged, aes(x = Factor3, y = Factor4, color = Description, label = SampleLabel)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "2. Scores by 'Description'", x="Factor 3", y="Factor 4") +
+  my_theme
+
+# 3) Scatter Plot: Grouped by 'Control'
+p31 <- ggplot(scores_merged, aes(x = Factor3, y = Factor4, color = Control, label = SampleLabel)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "3. Scores by 'Control'", x="Factor 3", y="Factor 4") +
+  my_theme
+
+# 4) Scatter Plot: Grouped by 'Treatment'
+p41 <- ggplot(scores_merged, aes(x = Factor3, y = Factor4, color = Treatment, label = SampleLabel)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(size = 2, alpha = 0.8) +
+  labs(title = "4. Scores by 'Treatment'", x="Factor 3", y="Factor 4") +
+  my_theme
+
+# Display Part 1
+grid.arrange(p11, p21, p31, p41, nrow = 2)
 
 
 
