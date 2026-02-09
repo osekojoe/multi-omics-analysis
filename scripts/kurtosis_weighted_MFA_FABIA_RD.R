@@ -2,8 +2,11 @@
 # 1. SETUP & LIBRARIES
 # ==============================================================================
 
+# Combined list of all required packages from both sections
 required_pkgs <- c("FactoMineR", "fabia", "clue", "pheatmap", 
-                   "ggplot2", "matrixStats", "reshape2", "e1071", "gtools")
+                   "ggplot2", "matrixStats", "reshape2", "e1071", "gtools", 
+                   "gridExtra", "dplyr")
+
 to_install <- required_pkgs[!(required_pkgs %in% installed.packages()[, "Package"])]
 if (length(to_install)) install.packages(to_install)
 
@@ -13,11 +16,10 @@ library(pheatmap)
 library(ggplot2)
 library(dplyr)
 library(gtools)      # For natural sorting (mixedsort)
-library(matrixStats)
+library(matrixStats) # Efficient matrix operations
 library(reshape2)
 library(e1071)       # For Kurtosis calculation
 library(gridExtra)
-library(reshape2)
 
 
 # ==============================================================================
@@ -61,7 +63,7 @@ message("--- Step 2: Visualizing Global Structure ---")
 
 # Helper to clean and scale
 clean_and_scale <- function(M) {
-  vars <- colVars(M)
+  vars <- matrixStats::colVars(M)
   M <- M[, vars > 1e-9] # Remove constant features
   s <- scale(M)
   s[is.na(s)] <- 0
@@ -93,133 +95,195 @@ pheatmap(Z_vis_ordered,
 
 
 # ==============================================================================
-# 4. CORE ALGORITHM: Kurtosis-Weighted MFA-FABIA
+# 4. CORE ALGORITHM: Kurtosis-Weighted MFA-FABIA (Updated Robust Version)
 # ==============================================================================
 
 message("--- Step 3: Running Hybrid MFA-FABIA ---")
 
-#' 0 MFA-FABIA Hybrid model pipeline 
-#' 1 MFA Stage: Used for preprocessing and weighting. 
-#'   It equalizes the variance between omics layers (so Proteomics doesn't drown
-#'   ... out mRNA) and assesses the global structure.
-#' 2 Kurtosis Weighting: Instead of standard variance, we weight features by
-#'   ... Kurtosis.
-#'  High kurtosis indicates "heavy tails" (non-Gaussian expression), 
-#'  which is the specific signal FABIA looks for.
-#' 3 FABIA Stage: Performs sparse matrix factorization to find biclusters 
-#'   ... (subsets of samples active on subsets of genes).
-#' Run FABIA with feature weighting based on Kurtosis (Non-Normality)
+#' Run FABIA with feature weighting based on Kurtosis and MFA Normalization
 #'
 #' @param Xlist List of matrices (omics data).
 #' @param gamma Tempering parameter for weights (0 = no weighting).
 #' @param p FABIA parameter (number of biclusters).
 #' @param alpha FABIA parameter (sparseness). Lower values = denser loadings.
-#' @param block_equalize Boolean. Equalize block variance
 #' @param scale_vars Boolean. Scale variables?
+#' @param block_equalize Boolean. Equalize block variance?
+#' @param block_equalize_method Method for equalization ("trace", "frobenius", "none").
+#' @param cap_weights_quantile Quantile to cap extreme weights (default 0.99).
+#' @param weight_floor Minimum weight to prevent zeroing out features.
+#' @param verbose Print diagnostic messages?
 #' @param seed Random seed.
-#' @return List containing model object, factor scores, loadings, weights, and kurtosis values.
-mfa_weighted_fabia <- function(Xlist, 
-                               gamma = 0.5, 
-                               p = 4, 
-                               alpha = 0.05, 
-                               block_equalize = TRUE,
+#' @return List containing weighted data, FABIA results, and weights.
+mfa_weighted_fabia <- function(Xlist,
+                               gamma = 0.5,
+                               p = 4,
+                               alpha = 0.5,
                                scale_vars = TRUE,
+                               block_equalize = TRUE,
+                               block_equalize_method = c("trace", "frobenius", "none"),
+                               cap_weights_quantile = 0.99,
+                               weight_floor = 1e-3,     # NEW: prevents zeroing out
+                               verbose = TRUE,          # NEW: diagnostics
                                seed = 123) {
   
+  `%||%` <- function(x, y) if (!is.null(x)) x else y
+  stopifnot(is.list(Xlist), length(Xlist) >= 2)
   set.seed(seed)
   
-  # A. Robust Preprocessing (Remove Zero-Variance)
-  Xlist_clean <- lapply(Xlist, function(M) {
-    vars <- matrixStats::colVars(as.matrix(M))
-    M[, vars > 1e-9, drop = FALSE]
-  })
+  block_equalize_method <- match.arg(block_equalize_method)
   
-  # B. Block-size–normalized PCA 
-  #Zlist <- lapply(Xlist_clean, function(X) {
-  #  if(scale_vars) {
-  #    s <- scale(X); s[is.na(s)] <- 0
-  #  } else {
-  #    s <- scale(X, scale = FALSE)
-  #  }
-  #  if(block_equalize) s <- s / sqrt(ncol(s))
-  #  return(s)
-  #})
+  clean_and_prep <- function(M) {
+    M <- as.matrix(M)
+    M[is.infinite(M)] <- NA_real_
+    vars <- matrixStats::colVars(M, na.rm = TRUE)
+    keep <- is.finite(vars) & vars > 1e-9
+    M <- M[, keep, drop = FALSE]
+    if (ncol(M) == 0) stop("A block has no non-constant finite-variance columns after cleaning.")
+    M
+  }
   
+  Xlist_clean <- lapply(Xlist, clean_and_prep)
   
-  # B. MFA block equalizing 
-  # 👉 (each block is weighted by the inverse of its first PCA eigenvalue:)
-  # 👉 Ensures each block contributes equally to the first global dimension.
-  # 👉 This equalizes structural variance, not just block size.
-  
+  # B) scaling + optional block equalization
   Zlist <- lapply(Xlist_clean, function(X) {
-    # scale variables
-    s <- scale(X)
-    s[is.na(s)] <- 0
-    if(block_equalize) {
-      pca_block <- prcomp(s, center = FALSE, scale. = FALSE)
-      lambda1 <- pca_block$sdev[1]^2
-      s <- s / sqrt(lambda1)
+    
+    if (scale_vars) {
+      s <- scale(X, center = TRUE, scale = TRUE)
+      s[is.na(s)] <- 0
+    } else {
+      s <- scale(X, center = TRUE, scale = FALSE)
+      s[is.na(s)] <- 0
     }
-    return(s)
+    
+    if (block_equalize && block_equalize_method != "none") {
+      if (block_equalize_method == "trace") {
+        tr <- sum(matrixStats::colVars(s), na.rm = TRUE)
+        if (is.finite(tr) && tr > 1e-12) s <- s / sqrt(tr)
+      } else if (block_equalize_method == "frobenius") {
+        fn <- sqrt(sum(s^2, na.rm = TRUE))
+        if (is.finite(fn) && fn > 1e-12) s <- s / fn
+      }
+    }
+    s
   })
   
+  names(Zlist) <- names(Zlist) %||% paste0("omic", seq_along(Zlist))
+  for (n in names(Zlist)) colnames(Zlist[[n]]) <- paste0(n, "_", colnames(Zlist[[n]]))
   
-  # 👉 Rename features with prefix (Crucial for splitting later)
-  for(n in names(Zlist)) colnames(Zlist[[n]]) <- paste0(n, "_", colnames(Zlist[[n]]))
-  
-  # Combine
   Z <- do.call(cbind, Zlist)
+  grp <- vapply(Zlist, ncol, integer(1))
   
-  # C. Feature Weighting (Kurtosis)
-  # 👉 Features were weighted by excess kurtosis to emphasize sparse, heavy-tailed 
-  # 👉 signals characteristic of bicluster structure, following the assumptions
-  # 👉 of FABIA :: Laplace-like priors, Sparse loadings, Few active features per factor
-  kurt_vals <- apply(Z, 2, e1071::kurtosis, type = 2, na.rm = TRUE)
-  w_raw <- pmax(0, kurt_vals)
-  mean_w <- mean(w_raw, na.rm = TRUE); if(mean_w==0) mean_w <- 1
-  w <- (w_raw / mean_w)^gamma
-  w[!is.finite(w)] <- 0
+  # C) weights
+  if (verbose) message("Calculating block-wise kurtosis for feature weighting...")
   
-  # Apply Weights
-  Z_w <- sweep(Z, 2, w, `*`)
+  safe_kurtosis <- function(M) {
+    apply(M, 2, function(v) {
+      tryCatch(e1071::kurtosis(v, type = 2, na.rm = TRUE), error = function(e) NA_real_)
+    })
+  }
   
-  # D. Run FABIA
+  kurtosis_per_block <- list()
+  weights_per_block  <- list()
+  
+  for (bn in names(Zlist)) {
+    M <- Zlist[[bn]]
+    k <- safe_kurtosis(M)
+    
+    # --- CRITICAL FIX: if gamma == 0 => true no-weighting (all ones)
+    if (gamma == 0) {
+      w <- rep(1, length(k))
+      names(w) <- colnames(M)
+      
+      kurtosis_per_block[[bn]] <- k
+      weights_per_block[[bn]]  <- w
+      next
+    }
+    
+    # More stable mapping: use positive kurtosis but with a floor so nothing becomes 0
+    w_raw <- pmax(0, k)
+    w_raw[!is.finite(w_raw)] <- 0
+    w_raw <- pmax(weight_floor, w_raw)  # floor prevents annihilation
+    
+    mean_w <- mean(w_raw, na.rm = TRUE)
+    if (!is.finite(mean_w) || mean_w <= 0) mean_w <- 1
+    
+    w <- (w_raw / mean_w)^gamma
+    w[!is.finite(w)] <- 1
+    
+    if (is.finite(cap_weights_quantile) && cap_weights_quantile < 1) {
+      cap <- suppressWarnings(stats::quantile(w, probs = cap_weights_quantile, na.rm = TRUE, names = FALSE))
+      if (is.finite(cap)) w <- pmin(w, cap)
+    }
+    
+    # renormalize to mean 1 within block
+    mw2 <- mean(w, na.rm = TRUE)
+    if (is.finite(mw2) && mw2 > 0) w <- w / mw2
+    
+    names(w) <- colnames(M)
+    kurtosis_per_block[[bn]] <- k
+    weights_per_block[[bn]]  <- w
+  }
+  
+  w_all <- unlist(weights_per_block, use.names = TRUE)
+  w_all <- w_all[colnames(Z)]
+  w_all[is.na(w_all)] <- 1  # if anything is missing, do not zero it out
+  
+  Z_w <- sweep(Z, 2, w_all, `*`)
+  
+  # Diagnostics: detect the “empty/constant” case before FABIA
+  if (verbose) {
+    col_sds <- matrixStats::colSds(Z_w, na.rm = TRUE)
+    msg <- sprintf("Pre-FABIA Z_w: dim=%dx%d; mean(colSD)=%.3g; min(colSD)=%.3g; frac(|x|<1e-12)=%.2f%%",
+                   nrow(Z_w), ncol(Z_w),
+                   mean(col_sds), min(col_sds),
+                   100 * mean(abs(Z_w) < 1e-12))
+    message(msg)
+  }
+  
+  if (ncol(Z_w) == 0) stop("Z_w has 0 columns after preprocessing.")
+  if (sd(as.vector(Z_w), na.rm = TRUE) < 1e-12) stop("Z_w is (near) constant after preprocessing/weighting.")
+  
+  cuts <- cumsum(grp)
+  weighted_blocks <- lapply(seq_along(grp), function(i) {
+    if (i == 1) Z_w[, 1:cuts[1], drop = FALSE]
+    else Z_w[, (cuts[i - 1] + 1):cuts[i], drop = FALSE]
+  })
+  names(weighted_blocks) <- names(Zlist)
+  
+  # D) FABIA
   fab_fit <- fabia::fabia(as.matrix(t(Z_w)), p = p, alpha = alpha, random = 1)
   
-  # Format Outputs
-  factor_scores <- t(fab_fit@Z) # Samples x Factors
-  loadings_all  <- fab_fit@L    # Features x Factors
+  factor_scores <- t(fab_fit@Z)
+  loadings_all  <- fab_fit@L
   
-  # --- Split Loadings per Block ---
-  # We use the prefixes we added earlier to reliably split the matrix back up
   loadings_per_block <- list()
-  for(n in names(Zlist)) {
-    # Find rows corresponding to this block (e.g., starts with "mRNA_")
-    pattern <- paste0("^", n, "_")
+  for (bn in names(Zlist)) {
+    pattern <- paste0("^", bn, "_")
     idx <- grep(pattern, rownames(loadings_all))
-    
-    if(length(idx) > 0) {
-      loadings_per_block[[n]] <- loadings_all[idx, , drop=FALSE]
-    }
+    if (length(idx) > 0) loadings_per_block[[bn]] <- loadings_all[idx, , drop = FALSE]
   }
   
   return(list(
-    model = fab_fit,
-    factor_scores = factor_scores,
-    loadings = loadings_all,         # Global matrix
-    loadings_per_block = loadings_per_block, # Separated list
-    weights = w,
-    kurtosis = kurt_vals
+    model              = fab_fit,        # Kept for backward compat with your visualization code
+    fabia              = fab_fit,        # Kept for consistency with newer code
+    factor_scores      = factor_scores,
+    loadings           = loadings_all,
+    loadings_per_block = loadings_per_block,
+    weights            = w_all,
+    kurtosis           = unlist(kurtosis_per_block)
   ))
 }
 
-# Run the Algorithm
+# Run the Algorithm (Updated Parameters)
+# Note: Using block_equalize_method="trace" for better stability than simple eigenvalue scaling
 res_hybrid <- mfa_weighted_fabia(X_list, 
                                  gamma = 0.5, 
                                  p = 4, 
-                                 alpha = 0.05,
+                                 alpha = 0.05, 
+                                 scale_vars = TRUE,
                                  block_equalize = TRUE,
-                                 scale_vars = TRUE)
+                                 block_equalize_method = "trace", 
+                                 seed = 123)
 
 # ==============================================================================
 # VISUALIZATION: Annotated Factor Scores
@@ -234,9 +298,6 @@ if(!exists("D17_metadata")) {
 }
 
 # 2. Prepare Annotation Dataframe
-# The heatmap has Samples as Rows ("X13", "X15"). We need a dataframe 
-# where rownames match the heatmap exactly.
-
 heatmap_data <- res_hybrid$factor_scores # ((Samples x Factors))
 
 # Clean "X" prefix to match metadata IDs (e.g. "X13" -> 13)
@@ -265,7 +326,7 @@ pheatmap(heatmap_data,
          cluster_cols = FALSE,      # Don't reorder Factors (keep 1, 2, 3, 4)
          cluster_rows = TRUE,       # Cluster Samples to see which group together
          display_numbers = TRUE,    # Show score values
-         annotation_row = annot_df,     
+         annotation_row = annot_df,      
          annotation_colors = ann_colors, 
          main = "Factor Scores (sample activity)")
 
@@ -273,15 +334,10 @@ pheatmap(heatmap_data,
 
 # ==============================================================================
 # 5. SCATTER PLOTS (for SAMPLE SCORES)
-          # 👉 How strongly a sample expresses a latent factor)
+#           # 👉 How strongly a sample expresses a latent factor)
 # ==============================================================================
 
 message("--- Step 4: Generating Scatter Plots ---")
-
-# --- A. Load Metadata ---
-
-D17_metadata <- read.csv(file = "../multi-omics radiation_data/D17_metadata.csv",
-                         header = TRUE, check.names = FALSE, stringsAsFactors = FALSE)
 
 scores_df <- as.data.frame(res_hybrid$factor_scores)
 colnames(scores_df) <- paste0("Factor", 1:ncol(scores_df))
@@ -424,7 +480,7 @@ plot_factor_scan <- function(data, group_col, title_text) {
     geom_segment(aes(x = OrderedSample, xend = OrderedSample, y = 0, yend = Score), alpha=0.5) +
     geom_point(size = 3, alpha = 0.9) +
     
-    # Facet by Factor (Show F1, F2, F3, F4)     
+    # Facet by Factor (Show F1, F2, F3, F4)      
     facet_wrap(~Factor, ncol = 2, scales = "free_y") +
     
     labs(title = title_text,
@@ -516,8 +572,8 @@ message("Generating Unified Loading Heatmaps...")
 #' @param title_text Main title for the plot
 #' @param top_n Number of top features per factor to select
 #' @param annotate_type Boolean. If TRUE, adds an "mRNA/Protein" annotation bar 
-#'        and hides row names (best for Global plots). If FALSE, strips prefixes 
-#'        and shows row names (best for Per-Omic plots).
+#'         and hides row names (best for Global plots). If FALSE, strips prefixes 
+#'         and shows row names (best for Per-Omic plots).
 plot_loading_heatmap <- function(loading_matrix, title_text, top_n = 50, annotate_type = FALSE) {
   
   # 1. Identify Top N features for EACH factor
@@ -562,8 +618,8 @@ plot_loading_heatmap <- function(loading_matrix, title_text, top_n = 50, annotat
            breaks = breaks_list,
            annotation_row = annot_row,
            annotation_colors = annot_col,
-           cluster_cols = FALSE,       # Keep Factors ordered (1, 2, 3...)
-           cluster_rows = TRUE,        # Cluster features to show shared patterns
+           cluster_cols = FALSE,        # Keep Factors ordered (1, 2, 3...)
+           cluster_rows = TRUE,         # Cluster features to show shared patterns
            show_rownames = show_rows,
            fontsize_row = 4,
            main = paste0(title_text, " (Union of Top ", top_n, " per Factor)"))
@@ -708,9 +764,9 @@ ssl_matrix <- sapply(res_hybrid$loadings_per_block, function(loadings) {
 })
 
 # ssl_matrix is now:
-#         mRNA   Protein
-# Factor1 120.5  45.2
-# Factor2 80.3   90.1
+#         mRNA  Protein
+# Factor1 120.5 45.2
+# Factor2 80.3  90.1
 # ...
 
 # 2. Calculate Totals per Factor (Row Sums)
@@ -730,3 +786,4 @@ variance_table$Dominant_Layer <- ifelse(variance_table$`mRNA (%)` > 50, "mRNA", 
 # 5. Print the Table
 print("--- Variance Explained Composition per Factor ---")
 print(variance_table)
+
