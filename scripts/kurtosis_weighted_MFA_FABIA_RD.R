@@ -26,21 +26,21 @@ library(reshape2)
 
 message("--- Step 1: Loading & Aligning Data ---")
 
-# Load metadata
+# Load Metadata
 D17_metadata <- read.csv(file = "../multi-omics radiation_data/D17_metadata.csv",
-                          header = TRUE, row.names = 1, check.names = TRUE)
+                         header = TRUE, row.names = 1, check.names = TRUE)
 
-# 2.1 Load Datasets (Input: Features as Rows, Samples as Columns)
+# Load Omics Data (Input: Features as Rows, Samples as Columns)
 D17_mRNA_data <- read.csv(file = "../multi-omics radiation_data/D17_mRNA_cor_normalized_tmm.csv",
                           header = TRUE, row.names = 1, check.names = TRUE)
 D17_protein_data <- read.csv(file = "../multi-omics radiation_data/D17_Protein_cor_normalized_quant.csv",
                              header = TRUE, row.names = 1, check.names = TRUE)
 
-# 2.2 Transpose to Standard format (Samples as Rows, Features as Columns)
+# Transpose to Standard format (Samples as Rows, Features as Columns)
 mRNA_mat <- t(as.matrix(D17_mRNA_data))
 prot_mat <- t(as.matrix(D17_protein_data))
 
-# 2.3 Align Samples
+# Align Samples
 common_samples <- intersect(rownames(mRNA_mat), rownames(prot_mat))
 if(length(common_samples) == 0) stop("No matching samples found!")
 
@@ -59,7 +59,7 @@ message(sprintf("Aligned %d Samples across %d mRNA and %d Protein features.",
 
 message("--- Step 2: Visualizing Global Structure ---")
 
-# Helper to clean and scale for visualization
+# Helper to clean and scale
 clean_and_scale <- function(M) {
   vars <- colVars(M)
   M <- M[, vars > 1e-9] # Remove constant features
@@ -82,14 +82,14 @@ rownames(annotation_df) <- colnames(Z_vis)
 sorted_samples <- gtools::mixedsort(rownames(Z_vis))
 Z_vis_ordered <- t(Z_vis[sorted_samples, ])
 
-# Render
+# Render Global Heatmap
 pheatmap(Z_vis_ordered,
          color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
          breaks = seq(-3, 3, length.out = 100),
          show_rownames = FALSE, show_colnames = TRUE,
          cluster_cols = FALSE, cluster_rows = FALSE, # Manual Order
          annotation_row = annotation_df,
-         main = "Global Multi-Omics")
+         main = "Global Multi-Omics Data Structure")
 
 
 # ==============================================================================
@@ -576,7 +576,7 @@ plot_loading_heatmap <- function(loading_matrix, title_text, top_n = 50, annotat
 plot_loading_heatmap(res_hybrid$loadings, 
                      "Global Top Loadings", 
                      top_n = 50, 
-                     annotate_type = TRUE)
+                     annotate_type = FALSE)
 
 
 
@@ -695,3 +695,38 @@ grid.arrange(mRNA_plots[[1]], prot_plots[[1]],
 
 
 
+# ==============================================================================
+# 8. VARIANCE EXPLAINED (Per Factor / Per Omic)
+# ==============================================================================
+
+message("Generating Variance Percentage Table...")
+
+# 1. Calculate Sum of Squared Loadings (SSL) per block/factor
+# (Re-using logic from previous step for clarity)
+ssl_matrix <- sapply(res_hybrid$loadings_per_block, function(loadings) {
+  colSums(loadings^2)
+})
+
+# ssl_matrix is now:
+#         mRNA   Protein
+# Factor1 120.5  45.2
+# Factor2 80.3   90.1
+# ...
+
+# 2. Calculate Totals per Factor (Row Sums)
+total_variance_per_factor <- rowSums(ssl_matrix)
+
+# 3. Calculate Percentages
+percent_matrix <- (ssl_matrix / total_variance_per_factor) * 100
+
+# 4. Format the Table
+# Round to 2 decimal places and add "%" sign
+variance_table <- as.data.frame(round(percent_matrix, 2))
+colnames(variance_table) <- c("mRNA (%)", "Protein (%)")
+
+# Add a "Dominant Layer" column for quick interpretation
+variance_table$Dominant_Layer <- ifelse(variance_table$`mRNA (%)` > 50, "mRNA", "Protein")
+
+# 5. Print the Table
+print("--- Variance Explained Composition per Factor ---")
+print(variance_table)
